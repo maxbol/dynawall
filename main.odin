@@ -24,6 +24,7 @@ package main
 // fmt contains formatted I/O procedures.
 // https://pkg.odin-lang.org/core/fmt/
 import "core:fmt"
+import "core:math"
 // C interoperation compatibility
 import "core:c"
 import "core:os"
@@ -34,6 +35,20 @@ import gl "vendor:OpenGL"
 // We use GLFW for cross platform window creation and input handling
 import "vendor:glfw"
 
+Color :: struct {
+	r: f32,
+	g: f32,
+	b: f32,
+}
+
+Palette :: struct {
+	accents:      [10]Color,
+	accents_size: u32,
+}
+
+PaletteData :: struct {
+	accents: []string,
+}
 
 // Odin has type type inference
 // variableName := value
@@ -49,12 +64,17 @@ GL_MAJOR_VERSION: c.int : 3
 // Constant with type inference
 GL_MINOR_VERSION :: 3
 
+PALETTE_ROSEPINE: PaletteData = {
+	accents = {"#eb6f92", "#f6c177", "#ebbcba", "#31748f", "#9ccfd8", "#c4a7e7"},
+}
+
 // Our own boolean storing if the application is running
 // We use b32 for allignment and easy compatibility with the glfw.WindowShouldClose procedure
 // See https://odin-lang.org/docs/overview/#basic-types for more information on the types in Odin
 running: b32 = true
 window: glfw.WindowHandle
 resx, resy: c.int
+
 
 // The main function is the entry point for the application
 // In Odin functions/methods are more precisely named procedures
@@ -166,6 +186,9 @@ main :: proc() {
 	gl.EnableVertexAttribArray(0)
 	gl.VertexAttribPointer(0, 2, gl.FLOAT, gl.FALSE, 0, 0)
 
+	palette_parsed := parse_palette(PALETTE_ROSEPINE)
+
+
 	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
 	// There is only one kind of loop in Odin called for
 	// https://odin-lang.org/docs/overview/#for-statement
@@ -185,12 +208,14 @@ main :: proc() {
 			f32(resy),
 			f32(0.0),
 		)
-
-		// accents_start := get_uniform_location(program, "iPaletteAccents\x00")
-		//
-		// gl.Uniform3f(accents_start, 1, 0, 0)
-		// gl.Uniform3f(accents_start + 1, 0, 1, 0)
-		// gl.Uniform3f(accents_start + 2, 0, 0, 1)
+		accents_location := get_uniform_location(program, "iPaletteAccents\x00")
+		accents_size_location := get_uniform_location(program, "iPaletteAccentsSize\x00")
+		gl.Uniform1ui(accents_size_location, palette_parsed.accents_size)
+		for i: u32 = 0; i < palette_parsed.accents_size; i += 1 {
+			loc: i32 = accents_location + i32(i)
+			color := palette_parsed.accents[i]
+			gl.Uniform3f(loc, color.r, color.g, color.b)
+		}
 
 		// draw stuff
 		gl.BindVertexArray(vao)
@@ -219,4 +244,56 @@ size_callback :: proc "c" (window: glfw.WindowHandle, width, height: i32) {
 // NOTE: str has to be zero-terminated, so add a \x00 at the end
 get_uniform_location :: proc(program: u32, str: string) -> i32 {
 	return gl.GetUniformLocation(program, strings.clone_to_cstring(str))
+}
+
+hex_to_col :: proc(hex: string) -> (bool, Color) {
+	color_bytes: [3]byte
+	last_byteval: byte = 0
+	hex_lower := strings.to_lower(hex)
+
+	for rune, idx in hex_lower {
+		if (idx == 0) {
+			if (rune != '#') {
+				return false, Color{}
+			}
+			continue
+		}
+		byteval: byte
+		if (rune >= 0x30 && rune <= 0x39) {
+			byteval = byte(rune) - 0x30
+		} else if (rune >= 0x61 && rune <= 0x66) {
+			byteval = 10 + byte(rune) - 0x61
+		} else {
+			return false, Color{}
+		}
+		if (idx % 2 != 0) {
+			last_byteval = byteval * 16
+		} else {
+			c_idx: uint = uint(math.floor(f32(idx - 1) / 2))
+			color_bytes[c_idx] = last_byteval + byteval
+		}
+	}
+
+	color := Color {
+		r = f32(color_bytes[0]) / 255,
+		g = f32(color_bytes[1]) / 255,
+		b = f32(color_bytes[2]) / 255,
+	}
+
+	return true, color
+}
+
+parse_palette :: proc(palette_data: PaletteData) -> Palette {
+	palette := Palette{}
+
+	for accent, i in palette_data.accents {
+		ok, color := hex_to_col(accent)
+		if (!ok) {
+			continue
+		}
+		palette.accents[i] = color
+		palette.accents_size += 1
+	}
+
+	return palette
 }
