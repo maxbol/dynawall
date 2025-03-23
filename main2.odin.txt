@@ -1,6 +1,7 @@
+ 
 package main
+
 // TODO(2025-03-23, Max Bolotin): Post-shader upscaling via render texture
-// TODO(2025-03-23, Max Bolotin): Remove loop effect from resetting timer, make shader flow continous
 // TODO(2025-03-23, Max Bolotin): Better way of handling brightness/blending with bg color. How can we make background color of palette be present in the voronoi tesselations without muddying the look of the palette?
 // TODO(2025-03-23, Max Bolotin): Better way of selecting which monitor to display on (if it's a wallpaper it should probably be displayed on all monitors - one process per monitor?)
 
@@ -50,11 +51,171 @@ CONFIG_FILE_PATH :: "$HOME/.config/dynawall.conf"
 CONFIG_FILE_TEMPLATE :: #load("./dynawall.conf.tmpl")
 
 running: b32 = true
-window: glfw.WindowHandle
-resx, resy: c.int
-mouse_x: f64 = 0
-mouse_y: f64 = 0
 config: Config
+
+UniformLocations :: struct {
+	time_location:         i32,
+	time_delta_location:   i32,
+	resolution_location:   i32,
+	is_dark_location:      i32,
+	bg_rgb_location:       i32,
+	bg_hsv_location:       i32,
+	accents_rgb_location:  i32,
+	accents_hsv_location:  i32,
+	accents_size_location: i32,
+	mouse_location:        i32,
+}
+
+ServeContext :: struct {
+	local_time:  f32,
+	start, end:  time.Tick,
+	delta_ns:    time.Duration,
+	delta:       f64,
+	glfw_time:   f64,
+	frame_time:  f64,
+	time_cyclic: f64,
+	frame:       i32,
+	window:      glfw.WindowHandle,
+}
+
+serve_close :: proc(ctx: ServeContext) {
+	glfw.DestroyWindow(ctx.window)
+}
+
+serve_init :: proc(monitor: glfw.MonitorHandle, program: u32) {
+	ctx := ServeContext{}
+	ctx.start = time.tick_now()
+
+	glfw.WindowHint(glfw.CONTEXT_VERSION_MAJOR, GL_MAJOR_VERSION)
+	glfw.WindowHint(glfw.CONTEXT_VERSION_MINOR, GL_MINOR_VERSION)
+	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+	glfw.WindowHint(glfw.DECORATED, glfw.FALSE)
+	glfw.WindowHint(glfw.FOCUSED, glfw.FALSE)
+
+	if (ODIN_OS == .Darwin) {
+		glfw.WindowHint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
+	} else {
+		glfw.WindowHintString(glfw.WAYLAND_APP_ID, PROGRAMNAME)
+	}
+
+	video_mode := glfw.GetVideoMode(monitor)
+	ctx.window = glfw.CreateWindow(video_mode.width, video_mode.height, PROGRAMNAME, nil, nil)
+	if ctx.window == nil {
+		fmt.println("Unable to create window")
+		return
+	}
+
+	glfw.SetCursorPosCallback(ctx.window, cursor_position_callback)
+	glfw.SetKeyCallback(ctx.window, key_callback)
+	glfw.SetFramebufferSizeCallback(ctx.window, size_callback)
+
+	glfw.MakeContextCurrent(ctx.window)
+	glfw.SwapInterval(1)
+
+	frame_time: f64 = 0
+	time_cyclic: f64 = 0
+	start, end: time.Tick
+	start = time.tick_now()
+	delta_ns: time.Duration = 0
+	delta: f64 = f64(delta_ns)
+	glfw_time: f64 = 0
+
+	local_time: f32 = 0
+
+	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
+
+	frame := 0
+}
+
+serve_update :: proc(ctx: ^ServeContext, program: u32, ul: UniformLocations, vao: u32) {
+	if (glfw.WindowShouldClose(ctx.window)) {
+		running = false
+		return
+	}
+
+	ctx.start = time.tick_now()
+
+	width, height := glfw.GetFramebufferSize(ctx.window)
+
+	gl.Viewport(0, 0, width, height)
+	gl.Clear(gl.COLOR_BUFFER_BIT)
+
+	gl.UseProgram(program)
+
+	ctx.glfw_time = glfw.GetTime()
+	// if (glfw_time > 60) {
+	// 	glfw_time = math.mod_f64(glfw_time, 60)
+	// 	glfw.SetTime(glfw_time)
+	// }
+
+	gl.Uniform1f(ul.time_location, f32(ctx.glfw_time))
+	gl.Uniform1f(ul.time_delta_location, f32(ctx.delta))
+	gl.Uniform3f(ul.resolution_location, f32(width), f32(height), 0)
+
+	if ul.is_dark_location != -1 {
+		gl.Uniform1ui(ul.is_dark_location, u32(config.palette.is_dark))
+	}
+
+	if ul.bg_rgb_location != -1 {
+		gl.Uniform3f(
+			ul.bg_rgb_location,
+			config.palette.bg_rgb.r,
+			config.palette.bg_rgb.g,
+			config.palette.bg_rgb.b,
+		)
+	}
+
+	if ul.bg_hsv_location != -1 {
+		gl.Uniform3f(
+			ul.bg_hsv_location,
+			config.palette.bg_hsv.h,
+			config.palette.bg_hsv.s,
+			config.palette.bg_hsv.v,
+		)
+	}
+
+	if ul.accents_size_location != -1 {
+		gl.Uniform1ui(ul.accents_size_location, config.palette.accents_size)
+	}
+
+	if ul.accents_rgb_location != -1 || ul.accents_hsv_location != -1 {
+		for i: u32 = 0; i < config.palette.accents_size; i += 1 {
+			if (ul.accents_rgb_location != -1) {
+				color := config.palette.accents_rgb[i]
+				loc: i32 = ul.accents_rgb_location + i32(i)
+				gl.Uniform3f(loc, color.r, color.g, color.b)
+			}
+			if (ul.accents_hsv_location != -1) {
+				color := config.palette.accents_hsv[i]
+				loc: i32 = ul.accents_hsv_location + i32(i)
+				gl.Uniform3f(loc, color.h, color.s, color.v)
+			}
+		}
+	}
+
+	gl.BindVertexArray(vao)
+	gl.DrawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, nil)
+
+	glfw.SwapBuffers(ctx.window)
+
+	glfw.PollEvents()
+
+	end := time.tick_now()
+
+	ctx.delta_ns = time.tick_diff(ctx.start, ctx.end)
+
+	if (FRAME_LIMIT > 0) {
+		if (ctx.delta_ns < NANOSECONDS_PER_SECOND) {
+			time.sleep((NANOSECONDS_PER_SECOND / FRAME_LIMIT) - ctx.delta_ns)
+			ctx.delta = 1 / FRAME_LIMIT
+		} else {
+			ctx.delta = f64(ctx.delta_ns / NANOSECONDS_PER_SECOND)
+		}
+	} else {
+		ctx.delta = f64(ctx.delta_ns / NANOSECONDS_PER_SECOND)
+	}
+	ctx.frame = (ctx.frame + 1) % FRAME_LIMIT
+}
 
 main :: proc() {
 	ok := load_config()
@@ -74,44 +235,8 @@ main :: proc() {
 		fmt.println("Failed to initialize GLFW")
 		return
 	}
+
 	defer glfw.Terminate()
-
-	glfw.WindowHint(glfw.CONTEXT_VERSION_MAJOR, GL_MAJOR_VERSION)
-	glfw.WindowHint(glfw.CONTEXT_VERSION_MINOR, GL_MINOR_VERSION)
-	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-	glfw.WindowHint(glfw.DECORATED, glfw.FALSE)
-	glfw.WindowHint(glfw.FOCUSED, glfw.FALSE)
-
-	if (ODIN_OS == .Darwin) {
-		glfw.WindowHint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
-	} else {
-		glfw.WindowHintString(glfw.WAYLAND_APP_ID, PROGRAMNAME)
-	}
-
-	monitors := glfw.GetMonitors()
-	monitor := len(monitors) > 1 ? monitors[1] : monitors[0]
-
-	video_mode := glfw.GetVideoMode(monitor)
-
-	resx, resy = video_mode.width, video_mode.height
-	window = glfw.CreateWindow(resx, resy, PROGRAMNAME, nil, nil)
-	defer glfw.DestroyWindow(window)
-
-	glfw.SetCursorPosCallback(window, cursor_position_callback)
-
-	if window == nil {
-		fmt.println("Unable to create window")
-		return
-	}
-
-	glfw.MakeContextCurrent(window)
-
-	glfw.SwapInterval(1)
-
-	glfw.SetKeyCallback(window, key_callback)
-	glfw.SetFramebufferSizeCallback(window, size_callback)
-
-	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
 
 	program, shader_success := gl.load_shaders("vertex_shader.vert", "./shaders/voronoi2.frag")
 	if (shader_success == false) {
@@ -119,6 +244,8 @@ main :: proc() {
 		return
 	}
 	defer gl.DeleteProgram(program)
+
+	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
 
 	vertices := []f32{1.0, 1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0}
 	indices := []u32{0, 1, 3, 1, 2, 3}
@@ -145,114 +272,7 @@ main :: proc() {
 
 	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
 
-	time_location := get_uniform_location(program, "iTime\x00")
-	time_delta_location := get_uniform_location(program, "iTimeDelta\x00")
-	resolution_location := get_uniform_location(program, "iResolution\x00")
-	is_dark_location := get_uniform_location(program, "iPaletteIsDark\x00")
-	bg_rgb_location := get_uniform_location(program, "iPaletteBgRgb\x00")
-	bg_hsv_location := get_uniform_location(program, "iPaletteBgHsv\x00")
-	accents_rgb_location := get_uniform_location(program, "iPaletteAccentsRgb\x00")
-	accents_hsv_location := get_uniform_location(program, "iPaletteAccentsHsv\x00")
-	accents_size_location := get_uniform_location(program, "iPaletteAccentsSize\x00")
-	mouse_location := get_uniform_location(program, "iMouse\x00")
-
-	frame_time: f64 = 0
-	time_cyclic: f64 = 0
-	start, end: time.Tick
-	start = time.tick_now()
-	delta_ns: time.Duration = 0
-	delta: f64 = f64(delta_ns)
-	glfw_time: f64 = 0
-
-	local_time: f32 = 0
-
-	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
-
-	frame := 0
-	for (!glfw.WindowShouldClose(window) && running) {
-		start = time.tick_now()
-
-		width, height := glfw.GetFramebufferSize(window)
-
-		gl.Viewport(0, 0, width, height)
-		gl.Clear(gl.COLOR_BUFFER_BIT)
-
-		gl.UseProgram(program)
-
-		glfw_time = glfw.GetTime()
-		// if (glfw_time > 60) {
-		// 	glfw_time = math.mod_f64(glfw_time, 60)
-		// 	glfw.SetTime(glfw_time)
-		// }
-
-		gl.Uniform1f(time_location, f32(glfw_time))
-		gl.Uniform1f(time_delta_location, f32(delta))
-		gl.Uniform3f(resolution_location, f32(width), f32(height), 0)
-
-		if is_dark_location != -1 {
-			gl.Uniform1ui(is_dark_location, u32(config.palette.is_dark))
-		}
-
-		if bg_rgb_location != -1 {
-			gl.Uniform3f(
-				bg_rgb_location,
-				config.palette.bg_rgb.r,
-				config.palette.bg_rgb.g,
-				config.palette.bg_rgb.b,
-			)
-		}
-
-		if bg_hsv_location != -1 {
-			gl.Uniform3f(
-				bg_hsv_location,
-				config.palette.bg_hsv.h,
-				config.palette.bg_hsv.s,
-				config.palette.bg_hsv.v,
-			)
-		}
-
-		if accents_size_location != -1 {
-			gl.Uniform1ui(accents_size_location, config.palette.accents_size)
-		}
-
-		if accents_rgb_location != -1 || accents_hsv_location != -1 {
-			for i: u32 = 0; i < config.palette.accents_size; i += 1 {
-				if (accents_rgb_location != -1) {
-					color := config.palette.accents_rgb[i]
-					loc: i32 = accents_rgb_location + i32(i)
-					gl.Uniform3f(loc, color.r, color.g, color.b)
-				}
-				if (accents_hsv_location != -1) {
-					color := config.palette.accents_hsv[i]
-					loc: i32 = accents_hsv_location + i32(i)
-					gl.Uniform3f(loc, color.h, color.s, color.v)
-				}
-			}
-		}
-
-		gl.BindVertexArray(vao)
-		gl.DrawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, nil)
-
-		glfw.SwapBuffers(window)
-
-		glfw.PollEvents()
-
-		end := time.tick_now()
-
-		delta_ns = time.tick_diff(start, end)
-
-		if (FRAME_LIMIT > 0) {
-			if (delta_ns < NANOSECONDS_PER_SECOND) {
-				time.sleep((NANOSECONDS_PER_SECOND / FRAME_LIMIT) - delta_ns)
-				delta = 1 / FRAME_LIMIT
-			} else {
-				delta = f64(delta_ns / NANOSECONDS_PER_SECOND)
-			}
-		} else {
-			delta = f64(delta_ns / NANOSECONDS_PER_SECOND)
-		}
-		frame = (frame + 1) % FRAME_LIMIT
-	}
+	serve_init()
 }
 
 key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
