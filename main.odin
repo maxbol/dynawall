@@ -6,7 +6,9 @@ package main
 import "base:runtime"
 import "core:c"
 import "core:encoding/json"
+import "core:flags"
 import "core:fmt"
+import "core:io"
 import "core:math"
 import "core:os"
 import "core:strings"
@@ -45,11 +47,11 @@ FRAME_LIMIT :: 24
 NANOSECONDS_PER_SECOND :: 1000 * 1000 * 1000
 GL_MAJOR_VERSION: c.int : 3
 GL_MINOR_VERSION :: 3
-CONFIG_FILE_PATH :: "$HOME/.config/dynawall.conf"
 CONFIG_FILE_TEMPLATE :: #load("./dynawall.conf.tmpl")
 
 running: b32 = true
 config: Config
+config_file: string
 
 UniformLocations :: struct {
 	time_location:         i32,
@@ -64,7 +66,7 @@ UniformLocations :: struct {
 	mouse_location:        i32,
 }
 
-ServeContext :: struct {
+TimeContext :: struct {
 	local_time:  f32,
 	start, end:  time.Tick,
 	delta_ns:    time.Duration,
@@ -72,17 +74,27 @@ ServeContext :: struct {
 	glfw_time:   f64,
 	frame_time:  f64,
 	time_cyclic: f64,
-	frame:       i32,
-	window:      glfw.WindowHandle,
 }
 
-serve_close :: proc(ctx: ^ServeContext) {
+ImageContext :: struct {
+	width:  i32,
+	height: i32,
+}
+
+ServeContext :: struct {
+	image:  ImageContext,
+	time:   TimeContext,
+	window: glfw.WindowHandle,
+	frame:  i32,
+}
+
+serve_close_context :: proc(ctx: ^ServeContext) {
 	glfw.DestroyWindow(ctx.window)
 }
 
-serve_init :: proc(monitor: glfw.MonitorHandle, program: u32) -> (bool, ServeContext) {
+serve_setup_context :: proc(monitor: glfw.MonitorHandle) -> (bool, ServeContext) {
 	ctx := ServeContext{}
-	ctx.start = time.tick_now()
+	ctx.time.start = time.tick_now()
 
 	glfw.WindowHint(glfw.CONTEXT_VERSION_MAJOR, GL_MAJOR_VERSION)
 	glfw.WindowHint(glfw.CONTEXT_VERSION_MINOR, GL_MINOR_VERSION)
@@ -110,9 +122,7 @@ serve_init :: proc(monitor: glfw.MonitorHandle, program: u32) -> (bool, ServeCon
 	glfw.MakeContextCurrent(ctx.window)
 	glfw.SwapInterval(1)
 
-	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
-
-	frame := 0
+	ctx.frame = 0
 
 	return true, ctx
 }
@@ -123,65 +133,20 @@ serve_update :: proc(ctx: ^ServeContext, program: u32, ul: UniformLocations, vao
 		return
 	}
 
-	ctx.start = time.tick_now()
+	glfw.MakeContextCurrent(ctx.window)
 
-	width, height := glfw.GetFramebufferSize(ctx.window)
+	ctx.time.start = time.tick_now()
 
-	gl.Viewport(0, 0, width, height)
+	ctx.image.width, ctx.image.height = glfw.GetFramebufferSize(ctx.window)
+
+	gl.Viewport(0, 0, ctx.image.width, ctx.image.height)
 	gl.Clear(gl.COLOR_BUFFER_BIT)
 
 	gl.UseProgram(program)
 
-	ctx.glfw_time = glfw.GetTime()
-	// if (glfw_time > 60) {
-	// 	glfw_time = math.mod_f64(glfw_time, 60)
-	// 	glfw.SetTime(glfw_time)
-	// }
+	ctx.time.glfw_time = glfw.GetTime()
 
-	gl.Uniform1f(ul.time_location, f32(ctx.glfw_time))
-	gl.Uniform1f(ul.time_delta_location, f32(ctx.delta))
-	gl.Uniform3f(ul.resolution_location, f32(width), f32(height), 0)
-
-	if ul.is_dark_location != -1 {
-		gl.Uniform1ui(ul.is_dark_location, u32(config.palette.is_dark))
-	}
-
-	if ul.bg_rgb_location != -1 {
-		gl.Uniform3f(
-			ul.bg_rgb_location,
-			config.palette.bg_rgb.r,
-			config.palette.bg_rgb.g,
-			config.palette.bg_rgb.b,
-		)
-	}
-
-	if ul.bg_hsv_location != -1 {
-		gl.Uniform3f(
-			ul.bg_hsv_location,
-			config.palette.bg_hsv.h,
-			config.palette.bg_hsv.s,
-			config.palette.bg_hsv.v,
-		)
-	}
-
-	if ul.accents_size_location != -1 {
-		gl.Uniform1ui(ul.accents_size_location, config.palette.accents_size)
-	}
-
-	if ul.accents_rgb_location != -1 || ul.accents_hsv_location != -1 {
-		for i: u32 = 0; i < config.palette.accents_size; i += 1 {
-			if (ul.accents_rgb_location != -1) {
-				color := config.palette.accents_rgb[i]
-				loc: i32 = ul.accents_rgb_location + i32(i)
-				gl.Uniform3f(loc, color.r, color.g, color.b)
-			}
-			if (ul.accents_hsv_location != -1) {
-				color := config.palette.accents_hsv[i]
-				loc: i32 = ul.accents_hsv_location + i32(i)
-				gl.Uniform3f(loc, color.h, color.s, color.v)
-			}
-		}
-	}
+	set_uniform_values(ul, ctx.time, ctx.image)
 
 	gl.BindVertexArray(vao)
 	gl.DrawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, nil)
@@ -190,37 +155,38 @@ serve_update :: proc(ctx: ^ServeContext, program: u32, ul: UniformLocations, vao
 
 	glfw.PollEvents()
 
-	end := time.tick_now()
+	ctx.time.end = time.tick_now()
 
-	ctx.delta_ns = time.tick_diff(ctx.start, ctx.end)
+	ctx.time.delta_ns = time.tick_diff(ctx.time.start, ctx.time.end)
 
 	if (FRAME_LIMIT > 0) {
-		if (ctx.delta_ns < NANOSECONDS_PER_SECOND) {
-			time.sleep((NANOSECONDS_PER_SECOND / FRAME_LIMIT) - ctx.delta_ns)
-			ctx.delta = 1 / FRAME_LIMIT
+		if (ctx.time.delta_ns < NANOSECONDS_PER_SECOND) {
+			time.sleep((NANOSECONDS_PER_SECOND / FRAME_LIMIT) - ctx.time.delta_ns)
+			ctx.time.delta = 1 / FRAME_LIMIT
 		} else {
-			ctx.delta = f64(ctx.delta_ns / NANOSECONDS_PER_SECOND)
+			ctx.time.delta = f64(ctx.time.delta_ns / NANOSECONDS_PER_SECOND)
 		}
 	} else {
-		ctx.delta = f64(ctx.delta_ns / NANOSECONDS_PER_SECOND)
+		ctx.time.delta = f64(ctx.time.delta_ns / NANOSECONDS_PER_SECOND)
 	}
 	ctx.frame = (ctx.frame + 1) % FRAME_LIMIT
 }
 
-main :: proc() {
-	ok := load_config()
-	if !ok {
-		fmt.println("Error loading initial config, falling back to application defaults")
-		ok, config = parse_config(CONFIG_FILE_TEMPLATE)
+export :: proc(args: []string) {
+	ExportOptions :: struct {
+		out:             string `args:"pos=0, required" usage:"filename of exported file, must be of formats PNG or HEIC"`,
+		seconds_elapsed: f64 `usage:"floating point number representing seconds elapsed since start of shader"`,
+		// clock:           string `usage:"ISO timestamp representing current time of the local system, defaults to current time"`,
 	}
-	if !ok {
-		fmt.println("Error parsing system wide config, something is seriously wrong")
-		fmt.println("Panicing")
-		os.exit(1)
-	}
+	opts: ExportOptions
 
-	posix.signal(posix.Signal.SIGUSR1, signal_reload_config)
+	flags.parse_or_exit(&opts, args)
 
+	time_ctx := TimeContext{}
+	time_ctx.glfw_time = opts.seconds_elapsed
+}
+
+serve :: proc(args: []string) {
 	if (glfw.Init() != true) {
 		fmt.println("Failed to initialize GLFW")
 		return
@@ -228,8 +194,34 @@ main :: proc() {
 
 	defer glfw.Terminate()
 
+	monitors := glfw.GetMonitors()
+	contexts: [dynamic]ServeContext
+
+	for monitor, i in monitors {
+		ok, ctx := serve_setup_context(monitor)
+		if !ok {
+			fmt.printfln("Error while initializing monitor context %d, panicing", i)
+			return
+		}
+		append(&contexts, ctx)
+	}
+
+	defer {
+		for &ctx in contexts {
+			serve_close_context(&ctx)
+		}
+	}
 
 	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
+
+	program_ok, program := create_shader_program()
+	if !program_ok {
+		return
+	}
+	defer gl.DeleteProgram(program)
+
+	ul := get_uniform_locations(program)
+
 
 	vertices := []f32{1.0, 1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0}
 	indices := []u32{0, 1, 3, 1, 2, 3}
@@ -256,47 +248,67 @@ main :: proc() {
 
 	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
 
-	program, shader_success := gl.load_shaders("vertex_shader.vert", "./shaders/voronoi2.frag")
-	if (shader_success == false) {
-		fmt.println("Error loading shader")
-		return
-	}
-	defer gl.DeleteProgram(program)
-
-	ul := UniformLocations{}
-
-	ul.time_location = get_uniform_location(program, "iTime\x00")
-	ul.time_delta_location = get_uniform_location(program, "iTimeDelta\x00")
-	ul.resolution_location = get_uniform_location(program, "iResolution\x00")
-	ul.is_dark_location = get_uniform_location(program, "iPaletteIsDark\x00")
-	ul.bg_rgb_location = get_uniform_location(program, "iPaletteBgRgb\x00")
-	ul.bg_hsv_location = get_uniform_location(program, "iPaletteBgHsv\x00")
-	ul.accents_rgb_location = get_uniform_location(program, "iPaletteAccentsRgb\x00")
-	ul.accents_hsv_location = get_uniform_location(program, "iPaletteAccentsHsv\x00")
-	ul.accents_size_location = get_uniform_location(program, "iPaletteAccentsSize\x00")
-	ul.mouse_location = get_uniform_location(program, "iMouse\x00")
-
-
-	monitors := glfw.GetMonitors()
-	contexts: [dynamic]ServeContext
-
-	for monitor, i in monitors {
-		ok, ctx := serve_init(monitor, program)
-		if !ok {
-			fmt.printfln("Error while initializing monitor context %d, panicing", i)
-			return
-		}
-		append(&contexts, ctx)
-	}
+	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
 
 	for running != false {
-		for &ctx in contexts {
+		for &ctx, i in contexts {
 			serve_update(&ctx, program, ul, vao)
 		}
 	}
 
-	for &ctx in contexts {
-		serve_close(&ctx)
+
+}
+
+main :: proc() {
+	ProgCmd :: enum {
+		serve,
+		export,
+	}
+
+	RootOptions :: struct {
+		command: ProgCmd `args:"pos=0, required" usage:"command to run"`,
+		config:  string `usage:"path to config file - default ~/.config/dynawall.conf"`,
+	}
+
+	ServeOptions :: struct {}
+
+	args: []string
+
+	switch (len(os.args)) {
+	case 0:
+		stdout := os.stream_from_handle(os.stdout)
+		flags.write_usage(stdout, RootOptions)
+		os.exit(0)
+	case:
+		args = os.args[1:]
+	}
+
+	root_options: RootOptions
+	flags.parse_or_exit(&root_options, args)
+
+	config_file = root_options.config
+	if config_file == "" {
+		config_file = "$HOME/.config/dynawall.conf"
+	}
+	fmt.printfln("config file: %s", config_file)
+
+	ok := load_config()
+	if !ok {
+		fmt.println("Error loading initial config, falling back to application defaults")
+		ok, config = parse_config(CONFIG_FILE_TEMPLATE)
+	}
+	if !ok {
+		fmt.println("Error parsing system wide config, something is seriously wrong")
+		fmt.println("Panicing")
+		os.exit(1)
+	}
+
+	switch root_options.command {
+	case .serve:
+		posix.signal(posix.Signal.SIGUSR1, signal_reload_config)
+		serve(args)
+	case .export:
+		export(args)
 	}
 }
 
@@ -500,7 +512,7 @@ signal_reload_config :: proc "c" (_: posix.Signal) {
 }
 
 load_config :: proc() -> bool {
-	config_file_path := replace_envs_in_str(CONFIG_FILE_PATH)
+	config_file_path := replace_envs_in_str(config_file)
 	exists := os.exists(config_file_path)
 
 	if !exists && !os.write_entire_file(config_file_path, CONFIG_FILE_TEMPLATE) {
@@ -526,4 +538,76 @@ load_config :: proc() -> bool {
 replace_envs_in_str :: proc(str: string) -> string {
 	output, _ := strings.replace_all(str, "$HOME", os.get_env("HOME"))
 	return output
+}
+
+get_uniform_locations :: proc(program: u32) -> UniformLocations {
+	ul := UniformLocations{}
+	ul.time_location = get_uniform_location(program, "iTime\x00")
+	ul.time_delta_location = get_uniform_location(program, "iTimeDelta\x00")
+	ul.resolution_location = get_uniform_location(program, "iResolution\x00")
+	ul.is_dark_location = get_uniform_location(program, "iPaletteIsDark\x00")
+	ul.bg_rgb_location = get_uniform_location(program, "iPaletteBgRgb\x00")
+	ul.bg_hsv_location = get_uniform_location(program, "iPaletteBgHsv\x00")
+	ul.accents_rgb_location = get_uniform_location(program, "iPaletteAccentsRgb\x00")
+	ul.accents_hsv_location = get_uniform_location(program, "iPaletteAccentsHsv\x00")
+	ul.accents_size_location = get_uniform_location(program, "iPaletteAccentsSize\x00")
+	ul.mouse_location = get_uniform_location(program, "iMouse\x00")
+	return ul
+}
+
+create_shader_program :: proc() -> (bool, u32) {
+	program, shader_success := gl.load_shaders("vertex_shader.vert", "./shaders/voronoi2.frag")
+	if (shader_success == false) {
+		fmt.println("Error loading shader")
+		return false, 0
+	}
+
+	return true, program
+}
+
+set_uniform_values :: proc(ul: UniformLocations, time: TimeContext, image: ImageContext) {
+	gl.Uniform1f(ul.time_location, f32(time.glfw_time))
+	gl.Uniform1f(ul.time_delta_location, f32(time.delta))
+	gl.Uniform3f(ul.resolution_location, f32(image.width), f32(image.height), 0)
+
+	if ul.is_dark_location != -1 {
+		gl.Uniform1ui(ul.is_dark_location, u32(config.palette.is_dark))
+	}
+
+	if ul.bg_rgb_location != -1 {
+		gl.Uniform3f(
+			ul.bg_rgb_location,
+			config.palette.bg_rgb.r,
+			config.palette.bg_rgb.g,
+			config.palette.bg_rgb.b,
+		)
+	}
+
+	if ul.bg_hsv_location != -1 {
+		gl.Uniform3f(
+			ul.bg_hsv_location,
+			config.palette.bg_hsv.h,
+			config.palette.bg_hsv.s,
+			config.palette.bg_hsv.v,
+		)
+	}
+
+	if ul.accents_size_location != -1 {
+		gl.Uniform1ui(ul.accents_size_location, config.palette.accents_size)
+	}
+
+	if ul.accents_rgb_location != -1 || ul.accents_hsv_location != -1 {
+		for i: u32 = 0; i < config.palette.accents_size; i += 1 {
+			if (ul.accents_rgb_location != -1) {
+				color := config.palette.accents_rgb[i]
+				loc: i32 = ul.accents_rgb_location + i32(i)
+				gl.Uniform3f(loc, color.r, color.g, color.b)
+			}
+			if (ul.accents_hsv_location != -1) {
+				color := config.palette.accents_hsv[i]
+				loc: i32 = ul.accents_hsv_location + i32(i)
+				gl.Uniform3f(loc, color.h, color.s, color.v)
+			}
+		}
+	}
 }
