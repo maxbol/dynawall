@@ -174,13 +174,17 @@ serve_update :: proc(ctx: ^ServeContext, program: u32, ul: UniformLocations, vao
 
 export :: proc(args: []string) {
 	ExportOptions :: struct {
-		out:             string `args:"pos=0, required" usage:"filename of exported file, must be of formats PNG or HEIC"`,
+		out:             string `args:"pos=0,required" usage:"filename of exported file, must be of formats PNG or HEIC"`,
 		seconds_elapsed: f64 `usage:"floating point number representing seconds elapsed since start of shader"`,
 		// clock:           string `usage:"ISO timestamp representing current time of the local system, defaults to current time"`,
 	}
 	opts: ExportOptions
 
-	flags.parse_or_exit(&opts, args)
+	fmt.println(args)
+
+	flags.parse_or_exit(&opts, args, .Unix)
+
+	fmt.println("export options", opts)
 
 	time_ctx := TimeContext{}
 	time_ctx.glfw_time = opts.seconds_elapsed
@@ -212,57 +216,26 @@ serve :: proc(args: []string) {
 		}
 	}
 
-	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
-
-	program_ok, program := create_shader_program()
-	if !program_ok {
+	gl_ok, gl_ctx := gl_setup()
+	if !gl_ok {
 		return
 	}
-	defer gl.DeleteProgram(program)
+	defer gl_teardown(&gl_ctx)
 
-	ul := get_uniform_locations(program)
-
-
-	vertices := []f32{1.0, 1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0}
-	indices := []u32{0, 1, 3, 1, 2, 3}
-
-	vao, vbo, ebo: u32
-	gl.GenVertexArrays(1, &vao)
-	gl.GenBuffers(1, &vbo)
-	gl.GenBuffers(1, &ebo)
-
-	defer gl.DeleteVertexArrays(1, &vao)
-	defer gl.DeleteBuffers(1, &vbo)
-	defer gl.DeleteBuffers(1, &ebo)
-
-	gl.BindVertexArray(vao)
-
-	gl.BindBuffer(gl.ARRAY_BUFFER, vbo)
-	gl.BufferData(gl.ARRAY_BUFFER, 12 * size_of(f32), &vertices[0], gl.STATIC_DRAW)
-
-	gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo)
-	gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, 6 * size_of(u32), &indices[0], gl.STATIC_DRAW)
-
-	gl.VertexAttribPointer(0, 3, gl.FLOAT, gl.FALSE, 3 * size_of(f32), 0)
-	gl.EnableVertexAttribArray(0)
-
-	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
-
-	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
+	ul := get_uniform_locations(gl_ctx.program)
 
 	for running != false {
 		for &ctx, i in contexts {
-			serve_update(&ctx, program, ul, vao)
+			serve_update(&ctx, gl_ctx.program, ul, gl_ctx.vao)
 		}
 	}
-
-
 }
 
 main :: proc() {
 	RootOptions :: struct {
-		command: string `args:"pos=0,required" usage:"command to run - either 'serve' or 'export'"`,
-		config:  string `usage:"path to config file - default ~/.config/dynawall.conf"`,
+		command:      string `args:"pos=0,required" usage:"command to run - either 'serve' or 'export'"`,
+		command_args: [dynamic]string `args:"variadic,hidden"`,
+		config:       string `usage:"path to config file - default ~/.config/dynawall.conf"`,
 	}
 
 	ServeOptions :: struct {}
@@ -270,15 +243,11 @@ main :: proc() {
 	args := os.args
 
 	root_options: RootOptions
-	flags.parse_or_exit(&root_options, args)
-
-	args = args[1:]
+	flags.parse_or_exit(&root_options, args, .Unix)
 
 	config_file = root_options.config
 	if config_file == "" {
 		config_file = "$HOME/.config/dynawall.conf"
-	} else {
-		args = args[1:]
 	}
 	fmt.printfln("config file: %s", config_file)
 
@@ -298,10 +267,10 @@ main :: proc() {
 	switch root_options.command {
 	case "serve":
 		posix.signal(posix.Signal.SIGUSR1, signal_reload_config)
-		serve(args)
+		serve(root_options.command_args[:])
 		break
 	case "export":
-		export(args)
+		export(root_options.command_args[:])
 		break
 	case:
 		fmt.println("Unknown command:", root_options.command)
@@ -607,4 +576,55 @@ set_uniform_values :: proc(ul: UniformLocations, time: TimeContext, image: Image
 			}
 		}
 	}
+}
+
+GLContext :: struct {
+	vao:     u32,
+	vbo:     u32,
+	ebo:     u32,
+	program: u32,
+}
+
+gl_teardown :: proc(gl_ctx: ^GLContext) {
+	gl.DeleteVertexArrays(1, &gl_ctx.vao)
+	gl.DeleteBuffers(1, &gl_ctx.vbo)
+	gl.DeleteBuffers(1, &gl_ctx.ebo)
+	gl.DeleteProgram(gl_ctx.program)
+}
+
+gl_setup :: proc() -> (bool, GLContext) {
+	gl_ctx := GLContext{}
+
+	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
+
+	program_ok, program := create_shader_program()
+	if !program_ok {
+		return false, GLContext{}
+	}
+
+	gl_ctx.program = program
+
+	vertices := []f32{1.0, 1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0}
+	indices := []u32{0, 1, 3, 1, 2, 3}
+
+	gl.GenVertexArrays(1, &gl_ctx.vao)
+	gl.GenBuffers(1, &gl_ctx.vbo)
+	gl.GenBuffers(1, &gl_ctx.ebo)
+
+	gl.BindVertexArray(gl_ctx.vao)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, gl_ctx.vbo)
+	gl.BufferData(gl.ARRAY_BUFFER, 12 * size_of(f32), &vertices[0], gl.STATIC_DRAW)
+
+	gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl_ctx.ebo)
+	gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, 6 * size_of(u32), &indices[0], gl.STATIC_DRAW)
+
+	gl.VertexAttribPointer(0, 3, gl.FLOAT, gl.FALSE, 3 * size_of(f32), 0)
+	gl.EnableVertexAttribArray(0)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+
+	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
+
+	return true, gl_ctx
 }
