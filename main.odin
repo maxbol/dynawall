@@ -260,35 +260,25 @@ serve :: proc(args: []string) {
 }
 
 main :: proc() {
-	ProgCmd :: enum {
-		serve,
-		export,
-	}
-
 	RootOptions :: struct {
-		command: ProgCmd `args:"pos=0, required" usage:"command to run"`,
+		command: string `args:"pos=0,required" usage:"command to run - either 'serve' or 'export'"`,
 		config:  string `usage:"path to config file - default ~/.config/dynawall.conf"`,
 	}
 
 	ServeOptions :: struct {}
 
-	args: []string
-
-	switch (len(os.args)) {
-	case 0:
-		stdout := os.stream_from_handle(os.stdout)
-		flags.write_usage(stdout, RootOptions)
-		os.exit(0)
-	case:
-		args = os.args[1:]
-	}
+	args := os.args
 
 	root_options: RootOptions
 	flags.parse_or_exit(&root_options, args)
 
+	args = args[1:]
+
 	config_file = root_options.config
 	if config_file == "" {
 		config_file = "$HOME/.config/dynawall.conf"
+	} else {
+		args = args[1:]
 	}
 	fmt.printfln("config file: %s", config_file)
 
@@ -303,12 +293,19 @@ main :: proc() {
 		os.exit(1)
 	}
 
+	fmt.println(root_options)
+
 	switch root_options.command {
-	case .serve:
+	case "serve":
 		posix.signal(posix.Signal.SIGUSR1, signal_reload_config)
 		serve(args)
-	case .export:
+		break
+	case "export":
 		export(args)
+		break
+	case:
+		fmt.println("Unknown command:", root_options.command)
+		os.exit(1)
 	}
 }
 
