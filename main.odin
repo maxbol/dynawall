@@ -2,8 +2,14 @@ package main
 // TODO(2025-03-23, Max Bolotin): Post-shader upscaling via render texture
 // TODO(2025-03-23, Max Bolotin): Better way of handling brightness/blending with bg color. How can we make background color of palette be present in the voronoi tesselations without muddying the look of the palette?
 // TODO(2025-03-23, Max Bolotin): Better way of selecting which monitor to display on (if it's a wallpaper it should probably be displayed on all monitors - one process per monitor?)
+// TODO(2025-03-26, Max Bolotin): Port another shader to dynawall (monterrey2?). Set up some themes in home manager to use it instead of voronoi2.
+// TODO(2025-03-26, Max Bolotin): Look into setting up an OpenGL context via EGL, and rendering onto a framebuffer
+// TODO(2025-03-26, Max Bolotin): Export as PNG
+// TODO(2025-03-26, Max Bolotin): Export as HEIC
+// TODO(2025-03-26, Max Bolotin): Export as GIF (boomerang effect? Maybe we always want to run the time through a sine function before passing it to the shader, so we can make sure the wallpaper loops smoothly even with a limited time frame)
 
 import "base:runtime"
+import cgl "cgl"
 import "core:c"
 import "core:encoding/json"
 import "core:flags"
@@ -11,11 +17,16 @@ import "core:fmt"
 import "core:io"
 import "core:math"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
 import gl "vendor:OpenGL"
+import egl "vendor:egl"
 import "vendor:glfw"
+import "vendor:stb/image"
+
+SHADER_HOT_RELOADING :: #config(SHADER_HOT_RELOADING, false)
 
 RgbColor :: struct {
 	r: f32,
@@ -38,8 +49,21 @@ Palette :: struct {
 	is_dark:      bool,
 }
 
+Options :: struct {
+	command:          string `args:"pos=0,required" usage:"command to run - either 'serve' or 'export'"`,
+	config:           string `usage:"path to config file - default ~/.config/dynawall.conf"`,
+	export_out:       string `args:"n=export-out" usage:"file to export image to when used with export command, must be either PNG och HEIC format, default is 'wallpaper.heic'`,
+	export_width:     i32 `usage:"width of the image being exported, by default set to the resolution width of the primary monitor"`,
+	export_height:    i32 `usage:"height of the image being exported, by default set to the resolution height of the primary monitor"`,
+	export_localtime: string `args:"n=export-local-time" usage:"overrides system local time when exporting a non-dynamic image (PNG)"`,
+	seconds_start:    f64 `args:"n=seconds-start" usage:"sets the initial number of seconds elapsed for the shader, or when exporting, the amount of seconds elapsed at the moment of snapshoting, defaults to 0"`,
+	seconds_end:      f64 `args:"n=seconds-end" usage:"sets the max amount of seconds the shader runs before resetting the time value to 0. If no value is set, the timer never resets."`,
+	boomerang:        bool `usage:"activates boomerang mode if --seconds-end is set. Makes the shader plot against a bezier triangle function of the time value, so that time periodically and smoothly returns to 0"`,
+}
+
 Config :: struct {
 	palette: Palette,
+	shader:  ShaderType,
 }
 
 PROGRAMNAME :: "Dynawall"
@@ -67,13 +91,15 @@ UniformLocations :: struct {
 }
 
 TimeContext :: struct {
-	local_time:  f32,
-	start, end:  time.Tick,
-	delta_ns:    time.Duration,
-	delta:       f64,
-	glfw_time:   f64,
-	frame_time:  f64,
-	time_cyclic: f64,
+	boomerang:              bool,
+	local_time:             f32,
+	start, end:             time.Tick,
+	delta_ns:               time.Duration,
+	delta:                  f64,
+	seconds_elapsed:        f64,
+	frame_time:             f64,
+	time_cyclic:            f64,
+	limit_start, limit_end: f64,
 }
 
 ImageContext :: struct {
@@ -88,208 +114,453 @@ ServeContext :: struct {
 	frame:  i32,
 }
 
-serve_close_context :: proc(ctx: ^ServeContext) {
-	glfw.DestroyWindow(ctx.window)
+ExportContext :: struct {
+	image:             ImageContext,
+	time:              TimeContext,
+	export_image_type: ExportImageType,
 }
 
-serve_setup_context :: proc(monitor: glfw.MonitorHandle) -> (bool, ServeContext) {
-	ctx := ServeContext{}
-	ctx.time.start = time.tick_now()
+ExportImageType :: enum {
+	GIF,
+	PNG,
+	HEIC,
+}
+
+GLContext :: struct {
+	vao:                    u32,
+	vbo:                    u32,
+	ebo:                    u32,
+	program:                u32,
+	shader_type:            ShaderType,
+	hot_reload_shader_path: string,
+	hot_reload_shader_ts:   i64,
+}
+
+ShaderType :: enum {
+	Helloworld = 0,
+	Voronoi2   = 1,
+	Monterrey2 = 2,
+}
+
+// Takes a value between 0 and 1 and interpolates it along a bezier curve
+bezier_blend :: proc {
+	bezier_blend_f32,
+	bezier_blend_f64,
+}
+bezier_blend_f32 :: proc(t: f32) -> f32 {
+	assert(t >= 0)
+	assert(t <= 1)
+	return t * t * (3 - 2 * t)
+}
+bezier_blend_f64 :: proc(t: f64) -> f64 {
+	assert(t >= 0)
+	assert(t <= 1)
+	return t * t * (3 - 2 * t)
+}
+
+calc_time_uniform :: proc(time_ctx: ^TimeContext) -> f64 {
+	t := time_ctx.seconds_elapsed
+	period := time_ctx.limit_end - time_ctx.limit_start
+
+	if time_ctx.limit_end != 0 {
+		if time_ctx.boomerang {
+			t = math.abs(triangle_wave(1, period * 4, t))
+			t_abs_offset := time_ctx.limit_start + time_ctx.seconds_elapsed
+			if t_abs_offset >= time_ctx.limit_end / 2 {
+				t = bezier_blend(t)
+			}
+			t = (t * period) + time_ctx.limit_start
+		} else {
+			t =
+				math.mod_f64(t, time_ctx.limit_end - time_ctx.limit_start) +
+				time_ctx.seconds_elapsed
+		}
+	} else {
+		t += time_ctx.limit_start
+	}
+
+	return t
+}
+
+create_time_ctx :: proc(opts: ^Options) -> (bool, TimeContext) {
+	time_ctx := TimeContext{}
+	time_ctx.start = time.tick_now()
+	time_ctx.limit_start = opts.seconds_start
+	time_ctx.limit_end = opts.seconds_end
+	time_ctx.boomerang = opts.boomerang
+
+	if time_ctx.limit_end == 0 && time_ctx.boomerang {
+		fmt.println("Error: Can't use boomerang mode if --seconds-end is not set or set to 0")
+		return false, TimeContext{}
+	}
+
+	return true, time_ctx
+}
+
+cursor_position_callback :: proc "c" (window: glfw.WindowHandle, x_pos: f64, y_pos: f64) {
+	// mouse_x = x_pos
+	// mouse_y = y_pos
+}
+
+draw :: proc(
+	image: ^ImageContext,
+	gl_ctx: ^GLContext,
+	time_ctx: ^TimeContext,
+	ul: ^UniformLocations,
+) {
+	gl.Viewport(0, 0, image.width, image.height)
+	gl.Clear(gl.COLOR_BUFFER_BIT)
+
+	gl.UseProgram(gl_ctx.program)
+
+	set_uniform_values(ul, time_ctx, image)
+
+	gl.BindVertexArray(gl_ctx.vao)
+	gl.DrawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, nil)
+}
+
+export :: proc(opts: ^Options) -> bool {
+	ctx := ExportContext{}
+
+	ctx_time_ok: bool
+	ctx_time_ok, ctx.time = create_time_ctx(opts)
+	if !ctx_time_ok {
+		return false
+	}
+
+	out := "wallpaper.png"
+	if opts.export_out != "" {
+		out = opts.export_out
+	}
+
+	out_rev := strings.reverse(out)
+	part_rev, _ := strings.split_iterator(&out_rev, ".")
+	part := strings.to_lower(strings.reverse(part_rev))
+
+	switch (part) {
+	case "png":
+		ctx.export_image_type = .PNG
+	case "gif":
+		ctx.export_image_type = .GIF
+	case "heic":
+		ctx.export_image_type = .HEIC
+	case:
+		fmt.println("Error: Unknwon output file format:", part)
+		os.exit(1)
+	}
+
+	fmt.println("part:", part)
+
+	if (glfw.Init() != true) {
+		fmt.println("Failed to initialize GLFW")
+		return false
+	}
+	defer glfw.Terminate()
+
+	primary_monitor := glfw.GetPrimaryMonitor()
+	primary_monitor_vm := glfw.GetVideoMode(primary_monitor)
+
+	if opts.export_width != 0 {
+		ctx.image.width = opts.export_width
+	} else {
+		ctx.image.width = primary_monitor_vm.width
+	}
+
+	if opts.export_height != 0 {
+		ctx.image.height = opts.export_height
+	} else {
+		ctx.image.height = primary_monitor_vm.height
+	}
 
 	glfw.WindowHint(glfw.CONTEXT_VERSION_MAJOR, GL_MAJOR_VERSION)
 	glfw.WindowHint(glfw.CONTEXT_VERSION_MINOR, GL_MINOR_VERSION)
 	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-	glfw.WindowHint(glfw.DECORATED, glfw.FALSE)
-	glfw.WindowHint(glfw.FOCUSED, glfw.FALSE)
 
 	if (ODIN_OS == .Darwin) {
 		glfw.WindowHint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
-	} else {
-		glfw.WindowHintString(glfw.WAYLAND_APP_ID, PROGRAMNAME)
 	}
 
-	video_mode := glfw.GetVideoMode(monitor)
-	ctx.window = glfw.CreateWindow(video_mode.width, video_mode.height, PROGRAMNAME, nil, nil)
-	if ctx.window == nil {
+	window := glfw.CreateWindow(ctx.image.width, ctx.image.height, PROGRAMNAME, nil, nil)
+	if window == nil {
 		fmt.println("Unable to create window")
-		return false, ServeContext{}
+		return false
 	}
+	defer glfw.DestroyWindow(window)
 
-	glfw.SetCursorPosCallback(ctx.window, cursor_position_callback)
-	glfw.SetKeyCallback(ctx.window, key_callback)
-	glfw.SetFramebufferSizeCallback(ctx.window, size_callback)
-
-	glfw.MakeContextCurrent(ctx.window)
+	glfw.HideWindow(window)
+	glfw.MakeContextCurrent(window)
 	glfw.SwapInterval(1)
 
-	ctx.frame = 0
-
-	return true, ctx
-}
-
-serve_update :: proc(ctx: ^ServeContext, program: u32, ul: UniformLocations, vao: u32) {
-	if (glfw.WindowShouldClose(ctx.window)) {
-		running = false
-		return
-	}
-
-	glfw.MakeContextCurrent(ctx.window)
-
-	ctx.time.start = time.tick_now()
-
-	ctx.image.width, ctx.image.height = glfw.GetFramebufferSize(ctx.window)
-
-	gl.Viewport(0, 0, ctx.image.width, ctx.image.height)
-	gl.Clear(gl.COLOR_BUFFER_BIT)
-
-	gl.UseProgram(program)
-
-	ctx.time.glfw_time = glfw.GetTime()
-
-	set_uniform_values(ul, ctx.time, ctx.image)
-
-	gl.BindVertexArray(vao)
-	gl.DrawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, nil)
-
-	glfw.SwapBuffers(ctx.window)
-
-	glfw.PollEvents()
-
-	ctx.time.end = time.tick_now()
-
-	ctx.time.delta_ns = time.tick_diff(ctx.time.start, ctx.time.end)
-
-	if (FRAME_LIMIT > 0) {
-		if (ctx.time.delta_ns < NANOSECONDS_PER_SECOND) {
-			time.sleep((NANOSECONDS_PER_SECOND / FRAME_LIMIT) - ctx.time.delta_ns)
-			ctx.time.delta = 1 / FRAME_LIMIT
-		} else {
-			ctx.time.delta = f64(ctx.time.delta_ns / NANOSECONDS_PER_SECOND)
-		}
-	} else {
-		ctx.time.delta = f64(ctx.time.delta_ns / NANOSECONDS_PER_SECOND)
-	}
-	ctx.frame = (ctx.frame + 1) % FRAME_LIMIT
-}
-
-export :: proc(args: []string) {
-	ExportOptions :: struct {
-		out:             string `args:"pos=0,required" usage:"filename of exported file, must be of formats PNG or HEIC"`,
-		seconds_elapsed: f64 `usage:"floating point number representing seconds elapsed since start of shader"`,
-		// clock:           string `usage:"ISO timestamp representing current time of the local system, defaults to current time"`,
-	}
-	opts: ExportOptions
-
-	fmt.println(args)
-
-	flags.parse_or_exit(&opts, args, .Unix)
-
-	fmt.println("export options", opts)
-
-	time_ctx := TimeContext{}
-	time_ctx.glfw_time = opts.seconds_elapsed
-}
-
-serve :: proc(args: []string) {
-	if (glfw.Init() != true) {
-		fmt.println("Failed to initialize GLFW")
-		return
-	}
-
-	defer glfw.Terminate()
-
-	monitors := glfw.GetMonitors()
-	contexts: [dynamic]ServeContext
-
-	for monitor, i in monitors {
-		ok, ctx := serve_setup_context(monitor)
-		if !ok {
-			fmt.printfln("Error while initializing monitor context %d, panicing", i)
-			return
-		}
-		append(&contexts, ctx)
-	}
-
-	defer {
-		for &ctx in contexts {
-			serve_close_context(&ctx)
-		}
-	}
+	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
 
 	gl_ok, gl_ctx := gl_setup()
 	if !gl_ok {
-		return
+		return false
 	}
 	defer gl_teardown(&gl_ctx)
 
 	ul := get_uniform_locations(gl_ctx.program)
 
-	for running != false {
-		for &ctx, i in contexts {
-			serve_update(&ctx, gl_ctx.program, ul, gl_ctx.vao)
+	fbo: u32 = 0
+	gl.GenFramebuffers(1, &fbo)
+	gl.BindFramebuffer(gl.FRAMEBUFFER, fbo)
+
+	rendered_texture: u32
+	gl.GenTextures(1, &rendered_texture)
+
+	gl.BindTexture(gl.TEXTURE_2D, rendered_texture)
+
+	gl.TexImage2D(
+		gl.TEXTURE_2D,
+		0,
+		gl.RGB,
+		ctx.image.width,
+		ctx.image.height,
+		0,
+		gl.RGB,
+		gl.UNSIGNED_BYTE,
+		nil,
+	)
+
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+
+	gl.FramebufferTexture(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, rendered_texture, 0)
+
+	if gl.CheckFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE {
+		fmt.println("Error setting up framebuffer")
+		return false
+	}
+
+	switch (ctx.export_image_type) {
+	case .GIF:
+	case .PNG:
+		draw(&ctx.image, &gl_ctx, &ctx.time, &ul)
+		out_size := ctx.image.width * ctx.image.height * 4
+		out := make([]byte, out_size)
+		gl.ReadPixels(0, 0, ctx.image.width, ctx.image.height, gl.RGBA, gl.UNSIGNED_BYTE, &out[0])
+		fmt.println("Successfully drew a frame to framebuffer and exported it to a byte array")
+
+		// out_path, err := os.absolute_path_from_relative(opts.export_out)
+		// if err != nil {
+		// 	fmt.println("Error resolving out path:", err)
+		// 	return false
+		// }
+
+		out_path := opts.export_out
+
+		file_exists := os.exists(out_path)
+		handle, err := os.open(out_path, os.O_WRONLY | os.O_CREATE)
+		if !file_exists {
+			err := os.fchmod(handle, os.S_IRUSR | os.S_IWUSR | os.S_IRGRP | os.S_IROTH)
+			if err != nil {
+				fmt.println("Error setting file permissions for exported file:", err)
+				return false
+			}
 		}
+		if err != nil {
+			fmt.println("Error opening file for writing:", opts.export_out, err)
+			return false
+		}
+		defer os.close(handle)
+
+		stream := os.stream_from_handle(handle)
+		writer, ok := io.to_writer(stream)
+
+		if !ok {
+			fmt.println("Unable to open write interface")
+			return false
+		}
+
+		WriteContext :: struct {
+			offset: int,
+			writer: io.Writer,
+		}
+		write_ctx: WriteContext = {
+			writer = writer,
+			offset = 0,
+		}
+
+		write_image_data :: proc "c" (ctx: rawptr, data: rawptr, size: c.int) {
+			context = runtime.default_context()
+			write_ctx := cast(^WriteContext)ctx
+			fmt.println("Got ", size, " bytes. Current offset = ", write_ctx.offset)
+			bytes := slice.bytes_from_ptr(data, int(size))
+			fmt.println("bytes len=", len(bytes))
+			_, err := io.write(write_ctx.writer, bytes, &write_ctx.offset)
+			if err != nil {
+				fmt.println("Write Error:", err)
+			}
+		}
+
+		image.flip_vertically_on_write(true)
+
+		write_result := image.write_png_to_func(
+			write_image_data,
+			&write_ctx,
+			ctx.image.width,
+			ctx.image.height,
+			4,
+			&out[0],
+			4 * ctx.image.width,
+		)
+
+		if write_result != 1 {
+			fmt.println("Warning: Got a non-successful write result from write_png_to_func")
+		}
+	case .HEIC:
 	}
+
+	return true
 }
 
-main :: proc() {
-	RootOptions :: struct {
-		command:      string `args:"pos=0,required" usage:"command to run - either 'serve' or 'export'"`,
-		command_args: [dynamic]string `args:"variadic,hidden"`,
-		config:       string `usage:"path to config file - default ~/.config/dynawall.conf"`,
+get_frag_shader_embedded :: proc(shader_type: ShaderType) -> string {
+	bytes: []byte
+	switch (shader_type) {
+	case .Monterrey2:
+		bytes = #load("./shaders/monterrey2.frag")
+	case .Voronoi2:
+		bytes = #load("./shaders/voronoi2.frag")
+	case .Helloworld:
+		bytes = #load("./shaders/helloworld.frag")
+	}
+	return transmute(string)bytes
+}
+
+get_frag_shader_path :: proc(shader_type: ShaderType) -> string {
+	path: string
+	switch (shader_type) {
+	case .Monterrey2:
+		path = "./shaders/monterrey2.frag"
+	case .Voronoi2:
+		path = "./shaders/voronoi2.frag"
+	case .Helloworld:
+		path = "./shaders/helloworld.frag"
+	}
+	return path
+}
+
+get_shader_prog :: proc(shader_type: ShaderType) -> (bool, u32) {
+	program: u32
+	ok: bool
+
+	if SHADER_HOT_RELOADING {
+		vs_path := get_vert_shader_path(shader_type)
+		fs_path := get_frag_shader_path(shader_type)
+		program, ok = gl.load_shaders_file(vs_path, fs_path)
+	} else {
+		vs_src := get_vert_shader_embedded(shader_type)
+		fs_src := get_frag_shader_embedded(shader_type)
+		program, ok = gl.load_shaders_source(vs_src, fs_src)
 	}
 
-	ServeOptions :: struct {}
-
-	args := os.args
-
-	root_options: RootOptions
-	flags.parse_or_exit(&root_options, args, .Unix)
-
-	config_file = root_options.config
-	if config_file == "" {
-		config_file = "$HOME/.config/dynawall.conf"
-	}
-	fmt.printfln("config file: %s", config_file)
-
-	ok := load_config()
 	if !ok {
-		fmt.println("Error loading initial config, falling back to application defaults")
-		ok, config = parse_config(CONFIG_FILE_TEMPLATE)
-	}
-	if !ok {
-		fmt.println("Error parsing system wide config, something is seriously wrong")
-		fmt.println("Panicing")
-		os.exit(1)
+		fmt.println("Error loading shader")
+		return false, 0
 	}
 
-	fmt.println(root_options)
-
-	switch root_options.command {
-	case "serve":
-		posix.signal(posix.Signal.SIGUSR1, signal_reload_config)
-		serve(root_options.command_args[:])
-		break
-	case "export":
-		export(root_options.command_args[:])
-		break
-	case:
-		fmt.println("Unknown command:", root_options.command)
-		os.exit(1)
-	}
-}
-
-key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
-	if key == glfw.KEY_ESCAPE {
-		running = false
-	}
-}
-
-size_callback :: proc "c" (window: glfw.WindowHandle, width, height: i32) {
-	gl.Viewport(0, 0, width, height)
+	return true, program
 }
 
 get_uniform_location :: proc(program: u32, str: string) -> i32 {
 	return gl.GetUniformLocation(program, strings.clone_to_cstring(str))
+}
+
+get_uniform_locations :: proc(program: u32) -> UniformLocations {
+	ul := UniformLocations{}
+	ul.time_location = get_uniform_location(program, "iTime\x00")
+	ul.time_delta_location = get_uniform_location(program, "iTimeDelta\x00")
+	ul.resolution_location = get_uniform_location(program, "iResolution\x00")
+	ul.is_dark_location = get_uniform_location(program, "iPaletteIsDark\x00")
+	ul.bg_rgb_location = get_uniform_location(program, "iPaletteBgRgb\x00")
+	ul.bg_hsv_location = get_uniform_location(program, "iPaletteBgHsv\x00")
+	ul.accents_rgb_location = get_uniform_location(program, "iPaletteAccentsRgb\x00")
+	ul.accents_hsv_location = get_uniform_location(program, "iPaletteAccentsHsv\x00")
+	ul.accents_size_location = get_uniform_location(program, "iPaletteAccentsSize\x00")
+	ul.mouse_location = get_uniform_location(program, "iMouse\x00")
+	return ul
+}
+
+get_vert_shader_embedded :: proc(shader_type: ShaderType) -> string {
+	bytes: []byte
+	switch (shader_type) {
+	case .Monterrey2:
+		fallthrough
+	case .Voronoi2:
+		fallthrough
+	case .Helloworld:
+		bytes = #load("./vertex_shader.vert")
+	}
+	return transmute(string)bytes
+}
+
+get_vert_shader_path :: proc(shader_type: ShaderType) -> string {
+	path: string
+	switch (shader_type) {
+	case .Monterrey2:
+		fallthrough
+	case .Voronoi2:
+		fallthrough
+	case .Helloworld:
+		path = "./vertex_shader.vert"
+	}
+	return path
+}
+
+gl_setup :: proc() -> (bool, GLContext) {
+	gl_ctx := GLContext{}
+
+	fmt.println("loading program for", config.shader)
+	program_ok, program := get_shader_prog(config.shader)
+	if !program_ok {
+		return false, GLContext{}
+	}
+
+	if SHADER_HOT_RELOADING {
+		gl_ctx.hot_reload_shader_path = get_frag_shader_path(config.shader)
+		info, err := os.stat(gl_ctx.hot_reload_shader_path)
+
+		if err != nil {
+			fmt.println("Error checking hot reload path, hot reloading will not work")
+		} else {
+			gl_ctx.hot_reload_shader_ts = info.modification_time._nsec
+		}
+
+	}
+
+	gl_ctx.shader_type = config.shader
+	gl_ctx.program = program
+
+	vertices := []f32{1.0, 1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0}
+	indices := []u32{0, 1, 3, 1, 2, 3}
+
+	gl.GenVertexArrays(1, &gl_ctx.vao)
+	gl.GenBuffers(1, &gl_ctx.vbo)
+	gl.GenBuffers(1, &gl_ctx.ebo)
+
+	gl.BindVertexArray(gl_ctx.vao)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, gl_ctx.vbo)
+	gl.BufferData(gl.ARRAY_BUFFER, 12 * size_of(f32), &vertices[0], gl.STATIC_DRAW)
+
+	gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl_ctx.ebo)
+	gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, 6 * size_of(u32), &indices[0], gl.STATIC_DRAW)
+
+	gl.VertexAttribPointer(0, 3, gl.FLOAT, gl.FALSE, 3 * size_of(f32), 0)
+	gl.EnableVertexAttribArray(0)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+
+	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
+
+	return true, gl_ctx
+}
+
+gl_teardown :: proc(gl_ctx: ^GLContext) {
+	gl.DeleteVertexArrays(1, &gl_ctx.vao)
+	gl.DeleteBuffers(1, &gl_ctx.vbo)
+	gl.DeleteBuffers(1, &gl_ctx.ebo)
+	gl.DeleteProgram(gl_ctx.program)
 }
 
 hex_to_col :: proc(hex: string) -> (bool, RgbColor) {
@@ -329,9 +600,175 @@ hex_to_col :: proc(hex: string) -> (bool, RgbColor) {
 	return true, color
 }
 
-cursor_position_callback :: proc "c" (window: glfw.WindowHandle, x_pos: f64, y_pos: f64) {
-	// mouse_x = x_pos
-	// mouse_y = y_pos
+key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
+	if key == glfw.KEY_ESCAPE {
+		running = false
+	}
+}
+
+load_config :: proc() -> bool {
+	config_file_path := replace_envs_in_str(config_file)
+	exists := os.exists(config_file_path)
+
+	if !exists && !os.write_entire_file(config_file_path, CONFIG_FILE_TEMPLATE) {
+		fmt.println("Couldn't create dynawall config, access denied")
+		return false
+	}
+
+	data, ok := os.read_entire_file(config_file_path)
+	if !ok {
+		fmt.println("Couldn't read dynawall config, unknown error")
+		return false
+	}
+
+	ok, config = parse_config(data)
+
+	if !ok {
+		return false
+	}
+
+	return true
+}
+
+main :: proc() {
+	args := os.args
+
+	opts: Options
+	flags.parse_or_exit(&opts, args, .Unix)
+
+	config_file = opts.config
+	if config_file == "" {
+		config_file = "$HOME/.config/dynawall.conf"
+	}
+	fmt.printfln("config file: %s", config_file)
+
+	if opts.seconds_start > 0 && opts.seconds_end > 0 && opts.seconds_start >= opts.seconds_end {
+		fmt.printfln(
+			"Error: When using --seconds-start with --seconds-end, --seconds-end must be bigger than --seconds-start",
+		)
+		os.exit(1)
+	}
+
+	ok := load_config()
+	if !ok {
+		fmt.println("Error loading initial config, falling back to application defaults")
+		ok, config = parse_config(CONFIG_FILE_TEMPLATE)
+	}
+	if !ok {
+		fmt.println("Error parsing system wide config, something is seriously wrong")
+		fmt.println("Panicing")
+		os.exit(1)
+	}
+
+	fmt.println(opts)
+
+	command_ok: bool
+
+	switch opts.command {
+	case "serve":
+		posix.signal(posix.Signal.SIGUSR1, signal_reload_config)
+		serve(&opts)
+	case "export":
+		command_ok = export(&opts)
+	case:
+		fmt.println("Unknown command:", opts.command)
+		command_ok = false
+	}
+
+	if !command_ok {
+		os.exit(1)
+	}
+
+	fmt.println("Successfully exited")
+	os.exit(0)
+}
+
+parse_config :: proc(data: []byte) -> (bool, Config) {
+	config := Config{}
+
+	ConfigJsonData :: struct {
+		palette: struct {
+			accents: [dynamic]string,
+			bg:      string,
+		},
+		shader:  string,
+	}
+
+	json_config: ConfigJsonData
+	err := json.unmarshal(data, &json_config)
+
+	if err != nil {
+		fmt.println("Error parsing config JSON")
+		return false, config
+	}
+
+	ok, bg_color := hex_to_col(json_config.palette.bg)
+
+	if !ok {
+		fmt.println("Error parsing background color", json_config.palette.bg)
+		return false, config
+	}
+
+	config.palette.bg_rgb = bg_color
+	config.palette.bg_hsv = rgb_to_hsv(bg_color)
+	config.palette.is_dark = config.palette.bg_hsv.v < 0.5
+
+	config.palette.accents_size = u32(len(json_config.palette.accents))
+
+	if config.palette.accents_size > 10 {
+		fmt.println(
+			"Warning: Config file includes too many accent colors, truncating to the first 10 only",
+		)
+		config.palette.accents_size = 10
+	}
+
+	for accent, i in json_config.palette.accents {
+		if i >= 10 {
+			break
+		}
+		ok, color := hex_to_col(accent)
+		if !ok {
+			fmt.printfln(
+				"Unexpected config data: Couldn't convert hex %s to an rgb color value",
+				accent,
+			)
+			return false, config
+		}
+		config.palette.accents_rgb[i] = color
+		config.palette.accents_hsv[i] = rgb_to_hsv(color)
+	}
+
+	config.shader = parse_shader(json_config.shader)
+
+	return true, config
+}
+
+parse_shader :: proc(shader_str: string) -> ShaderType {
+	switch (shader_str) {
+	case "voronoi2":
+		return .Voronoi2
+	case "monterrey2":
+		return .Monterrey2
+	case:
+		fmt.println("Warning: No shader selected in config, defaulting to helloworld")
+		fallthrough
+	case "default":
+		fallthrough
+	case "helloworld":
+		return .Helloworld
+	}
+}
+
+proper_mod_f32 :: proc(dividend: f32, divisor: f32) -> f32 {
+	return math.mod_f32(math.mod_f32(dividend, divisor) + divisor, divisor)
+}
+proper_mod_f64 :: proc(dividend: f64, divisor: f64) -> f64 {
+	return math.mod_f64(math.mod_f64(dividend, divisor) + divisor, divisor)
+}
+
+replace_envs_in_str :: proc(str: string) -> string {
+	output, _ := strings.replace_all(str, "$HOME", os.get_env("HOME"))
+	return output
 }
 
 rgb_to_hsv :: proc(rgb_color: RgbColor) -> HsvColor {
@@ -371,7 +808,7 @@ rgb_to_hsv :: proc(rgb_color: RgbColor) -> HsvColor {
 		h = 4 + g - r
 	}
 
-	h = proper_mod((h / 6), 1)
+	h = proper_mod_f32((h / 6), 1)
 
 	v := max
 
@@ -384,156 +821,186 @@ rgb_to_hsv :: proc(rgb_color: RgbColor) -> HsvColor {
 	return hsv
 }
 
-proper_mod :: proc(dividend: f32, divisor: f32) -> f32 {
-	return math.mod_f32(math.mod_f32(dividend, divisor) + divisor, divisor)
-}
-
-parse_config :: proc(data: []byte) -> (bool, Config) {
-	config := Config{}
-
-	parsed, err := json.parse(data)
-
-	if err != .None {
-		fmt.println("Couldn't parse config JSON")
-		return false, config
+serve :: proc(opts: ^Options) -> bool {
+	if (glfw.Init() != true) {
+		fmt.println("Failed to initialize GLFW")
+		return false
 	}
+	defer glfw.Terminate()
 
-	root: json.Object
+	monitors := glfw.GetMonitors()
+	contexts: [dynamic]ServeContext
 
-	#partial switch v in parsed {
-	case json.Object:
-		root = v
-	case:
-		fmt.println("Unexpected config data: Expected root entity to be an object")
-		return false, config
-	}
-
-	palette_root: json.Object
-
-	#partial switch v in root["palette"] {
-	case json.Object:
-		palette_root = v
-	case:
-		fmt.println("Unexpected config data: Expected <<palette> to contain an object")
-		return false, config
-	}
-
-	#partial switch v in palette_root["bg"] {
-	case json.String:
-		ok, color := hex_to_col(v)
+	for monitor, i in monitors {
+		ok, ctx := serve_setup_context(monitor, opts)
 		if !ok {
-			fmt.printfln(
-				"Unexpected config data: Couldn't convert hex %s to an rgb color value",
-				v,
-			)
-			return false, config
+			fmt.printfln("Error while initializing monitor context %d, panicing", i)
+			return false
 		}
-		config.palette.bg_rgb = color
-		config.palette.bg_hsv = rgb_to_hsv(color)
-		config.palette.is_dark = config.palette.bg_hsv.v < 0.5
+		append(&contexts, ctx)
 	}
 
-	accents_data: json.Array
-
-	#partial switch v in palette_root["accents"] {
-	case json.Array:
-		accents_data = v
-		config.palette.accents_size = min(u32(len(v)), 10)
-	case:
-		fmt.println("Unexpected config data: Expected <<accents>> to contain an array")
-		return false, config
-	}
-
-	for accent, i in accents_data {
-		if i >= 10 {
-			break
-		}
-		#partial switch v in accent {
-		case json.String:
-			ok, color := hex_to_col(v)
-			if !ok {
-				fmt.printfln(
-					"Unexpected config data: Couldn't convert hex %s to an rgb color value",
-					v,
-				)
-				return false, config
-			}
-			config.palette.accents_rgb[i] = color
-			config.palette.accents_hsv[i] = rgb_to_hsv(color)
-		case:
-			fmt.println(
-				"Unexpected config data: Expected all items in <<accents>> array to be strings",
-			)
-			return false, config
+	defer {
+		for &ctx in contexts {
+			serve_close_context(&ctx)
 		}
 	}
 
-	return true, config
-}
+	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
 
-signal_reload_config :: proc "c" (_: posix.Signal) {
-	context = runtime.default_context()
-	fmt.println("Reloading config")
-	_ = load_config()
-}
-
-load_config :: proc() -> bool {
-	config_file_path := replace_envs_in_str(config_file)
-	exists := os.exists(config_file_path)
-
-	if !exists && !os.write_entire_file(config_file_path, CONFIG_FILE_TEMPLATE) {
-		fmt.println("Couldn't create dynawall config, access denied")
+	gl_ok, gl_ctx := gl_setup()
+	if !gl_ok {
 		return false
 	}
+	defer gl_teardown(&gl_ctx)
 
-	data, ok := os.read_entire_file(config_file_path)
-	if !ok {
-		fmt.println("Couldn't read dynawall config, unknown error")
-		return false
-	}
+	ul := get_uniform_locations(gl_ctx.program)
 
-	ok, config = parse_config(data)
-
-	if !ok {
-		return false
+	for running != false {
+		for &ctx, i in contexts {
+			serve_update(&ctx, &gl_ctx, &ul)
+		}
 	}
 
 	return true
 }
 
-replace_envs_in_str :: proc(str: string) -> string {
-	output, _ := strings.replace_all(str, "$HOME", os.get_env("HOME"))
-	return output
+serve_close_context :: proc(ctx: ^ServeContext) {
+	glfw.DestroyWindow(ctx.window)
 }
 
-get_uniform_locations :: proc(program: u32) -> UniformLocations {
-	ul := UniformLocations{}
-	ul.time_location = get_uniform_location(program, "iTime\x00")
-	ul.time_delta_location = get_uniform_location(program, "iTimeDelta\x00")
-	ul.resolution_location = get_uniform_location(program, "iResolution\x00")
-	ul.is_dark_location = get_uniform_location(program, "iPaletteIsDark\x00")
-	ul.bg_rgb_location = get_uniform_location(program, "iPaletteBgRgb\x00")
-	ul.bg_hsv_location = get_uniform_location(program, "iPaletteBgHsv\x00")
-	ul.accents_rgb_location = get_uniform_location(program, "iPaletteAccentsRgb\x00")
-	ul.accents_hsv_location = get_uniform_location(program, "iPaletteAccentsHsv\x00")
-	ul.accents_size_location = get_uniform_location(program, "iPaletteAccentsSize\x00")
-	ul.mouse_location = get_uniform_location(program, "iMouse\x00")
-	return ul
-}
+serve_setup_context :: proc(monitor: glfw.MonitorHandle, opts: ^Options) -> (bool, ServeContext) {
+	ctx := ServeContext{}
 
-create_shader_program :: proc() -> (bool, u32) {
-	program, shader_success := gl.load_shaders("vertex_shader.vert", "./shaders/voronoi2.frag")
-	if (shader_success == false) {
-		fmt.println("Error loading shader")
-		return false, 0
+	time_ctx_ok: bool
+
+	time_ctx_ok, ctx.time = create_time_ctx(opts)
+	if !time_ctx_ok {
+		return false, ServeContext{}
 	}
 
-	return true, program
+	glfw.WindowHint(glfw.CONTEXT_VERSION_MAJOR, GL_MAJOR_VERSION)
+	glfw.WindowHint(glfw.CONTEXT_VERSION_MINOR, GL_MINOR_VERSION)
+	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+	glfw.WindowHint(glfw.DECORATED, glfw.FALSE)
+	glfw.WindowHint(glfw.FOCUSED, glfw.FALSE)
+	glfw.WindowHint(glfw.FOCUS_ON_SHOW, glfw.FALSE)
+
+	if (ODIN_OS == .Darwin) {
+		glfw.WindowHint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
+	} else {
+		glfw.WindowHintString(glfw.WAYLAND_APP_ID, PROGRAMNAME)
+	}
+
+	video_mode := glfw.GetVideoMode(monitor)
+	fs_monitor := ODIN_OS == .Darwin ? nil : monitor
+	ctx.window = glfw.CreateWindow(
+		video_mode.width,
+		video_mode.height,
+		PROGRAMNAME,
+		fs_monitor,
+		nil,
+	)
+	if ctx.window == nil {
+		fmt.println("Unable to create window")
+		return false, ServeContext{}
+	}
+
+	glfw.SetCursorPosCallback(ctx.window, cursor_position_callback)
+	glfw.SetKeyCallback(ctx.window, key_callback)
+	glfw.SetFramebufferSizeCallback(ctx.window, size_callback)
+
+	glfw.MakeContextCurrent(ctx.window)
+	glfw.SwapInterval(1)
+
+	ctx.frame = 0
+
+	return true, ctx
 }
 
-set_uniform_values :: proc(ul: UniformLocations, time: TimeContext, image: ImageContext) {
-	gl.Uniform1f(ul.time_location, f32(time.glfw_time))
-	gl.Uniform1f(ul.time_delta_location, f32(time.delta))
+serve_update :: proc(ctx: ^ServeContext, gl_ctx: ^GLContext, ul: ^UniformLocations) {
+	if (glfw.WindowShouldClose(ctx.window)) {
+		running = false
+		return
+	}
+
+	if ctx.frame == 0 {
+		if gl_ctx.shader_type != config.shader {
+			fmt.println("Shader type changed in config, loading new shader")
+
+			ok, program := get_shader_prog(config.shader)
+
+			if !ok {
+				fmt.println("Error loading shader")
+				os.exit(1)
+			}
+
+			gl.DeleteProgram(gl_ctx.program)
+
+			gl_ctx.program = program
+			gl_ctx.shader_type = config.shader
+
+			if SHADER_HOT_RELOADING {
+				gl_ctx.hot_reload_shader_path = get_frag_shader_path(config.shader)
+			}
+
+			ul^ = get_uniform_locations(gl_ctx.program)
+		}
+
+		if SHADER_HOT_RELOADING {
+			info, err := os.stat(gl_ctx.hot_reload_shader_path)
+
+			if err != nil {
+				fmt.println("Error checking hot reload path, hot reloading will not work")
+			} else if info.modification_time._nsec > gl_ctx.hot_reload_shader_ts {
+				fmt.println("Shader has changed, reloading")
+
+				ok, program := get_shader_prog(gl_ctx.shader_type)
+				if !ok {
+					fmt.println("Error reloading shader")
+				} else {
+					gl_ctx.program = program
+				}
+
+				gl_ctx.hot_reload_shader_ts = info.modification_time._nsec
+			}
+		}
+	}
+
+	glfw.MakeContextCurrent(ctx.window)
+
+	ctx.time.start = time.tick_now()
+
+	ctx.image.width, ctx.image.height = glfw.GetFramebufferSize(ctx.window)
+	ctx.time.seconds_elapsed = glfw.GetTime()
+
+	draw(&ctx.image, gl_ctx, &ctx.time, ul)
+
+	glfw.SwapBuffers(ctx.window)
+
+	glfw.PollEvents()
+
+	ctx.time.end = time.tick_now()
+
+	ctx.time.delta_ns = time.tick_diff(ctx.time.start, ctx.time.end)
+
+	if (FRAME_LIMIT > 0) {
+		if (ctx.time.delta_ns < NANOSECONDS_PER_SECOND) {
+			time.sleep((NANOSECONDS_PER_SECOND / FRAME_LIMIT) - ctx.time.delta_ns)
+			ctx.time.delta = 1 / FRAME_LIMIT
+		} else {
+			ctx.time.delta = f64(ctx.time.delta_ns / NANOSECONDS_PER_SECOND)
+		}
+	} else {
+		ctx.time.delta = f64(ctx.time.delta_ns / NANOSECONDS_PER_SECOND)
+	}
+	ctx.frame = (ctx.frame + 1) % FRAME_LIMIT
+}
+
+set_uniform_values :: proc(ul: ^UniformLocations, time_ctx: ^TimeContext, image: ^ImageContext) {
+	t := calc_time_uniform(time_ctx)
+	gl.Uniform1f(ul.time_location, f32(t))
+	gl.Uniform1f(ul.time_delta_location, f32(time_ctx.delta))
 	gl.Uniform3f(ul.resolution_location, f32(image.width), f32(image.height), 0)
 
 	if ul.is_dark_location != -1 {
@@ -578,53 +1045,31 @@ set_uniform_values :: proc(ul: UniformLocations, time: TimeContext, image: Image
 	}
 }
 
-GLContext :: struct {
-	vao:     u32,
-	vbo:     u32,
-	ebo:     u32,
-	program: u32,
+signal_reload_config :: proc "c" (_: posix.Signal) {
+	context = runtime.default_context()
+	old_shader := config.shader
+
+	fmt.println("Reloading config")
+	_ = load_config()
 }
 
-gl_teardown :: proc(gl_ctx: ^GLContext) {
-	gl.DeleteVertexArrays(1, &gl_ctx.vao)
-	gl.DeleteBuffers(1, &gl_ctx.vbo)
-	gl.DeleteBuffers(1, &gl_ctx.ebo)
-	gl.DeleteProgram(gl_ctx.program)
+size_callback :: proc "c" (window: glfw.WindowHandle, width, height: i32) {
+	gl.Viewport(0, 0, width, height)
 }
 
-gl_setup :: proc() -> (bool, GLContext) {
-	gl_ctx := GLContext{}
-
-	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
-
-	program_ok, program := create_shader_program()
-	if !program_ok {
-		return false, GLContext{}
-	}
-
-	gl_ctx.program = program
-
-	vertices := []f32{1.0, 1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0}
-	indices := []u32{0, 1, 3, 1, 2, 3}
-
-	gl.GenVertexArrays(1, &gl_ctx.vao)
-	gl.GenBuffers(1, &gl_ctx.vbo)
-	gl.GenBuffers(1, &gl_ctx.ebo)
-
-	gl.BindVertexArray(gl_ctx.vao)
-
-	gl.BindBuffer(gl.ARRAY_BUFFER, gl_ctx.vbo)
-	gl.BufferData(gl.ARRAY_BUFFER, 12 * size_of(f32), &vertices[0], gl.STATIC_DRAW)
-
-	gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl_ctx.ebo)
-	gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, 6 * size_of(u32), &indices[0], gl.STATIC_DRAW)
-
-	gl.VertexAttribPointer(0, 3, gl.FLOAT, gl.FALSE, 3 * size_of(f32), 0)
-	gl.EnableVertexAttribArray(0)
-
-	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
-
-	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
-
-	return true, gl_ctx
+triangle_wave :: proc {
+	triangle_wave_f32,
+	triangle_wave_f64,
+}
+triangle_wave_f32 :: proc(amplitude: f32, period: f32, x: f32) -> f32 {
+	return(
+		(4 * amplitude / period) * math.abs(proper_mod_f32(x - period / 4, period) - period / 2) -
+		amplitude \
+	)
+}
+triangle_wave_f64 :: proc(amplitude: f64, period: f64, x: f64) -> f64 {
+	return(
+		(4 * amplitude / period) * math.abs(proper_mod_f64(x - period / 4, period) - period / 2) -
+		amplitude \
+	)
 }
