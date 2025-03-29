@@ -9,7 +9,6 @@ package main
 // TODO(2025-03-26, Max Bolotin): Export as GIF (boomerang effect? Maybe we always want to run the time through a sine function before passing it to the shader, so we can make sure the wallpaper loops smoothly even with a limited time frame)
 
 import "base:runtime"
-import cgl "cgl"
 import "core:c"
 import "core:encoding/json"
 import "core:flags"
@@ -65,6 +64,12 @@ Config :: struct {
 	palette: Palette,
 	shader:  ShaderType,
 }
+
+IOWriteContext :: struct {
+	offset: int,
+	writer: io.Writer,
+}
+
 
 PROGRAMNAME :: "Dynawall"
 FRAME_LIMIT :: 24
@@ -169,15 +174,13 @@ calc_time_uniform :: proc(time_ctx: ^TimeContext) -> f64 {
 			if t_abs_offset >= time_ctx.limit_end / 2 {
 				t = bezier_blend(t)
 			}
-			t = (t * period) + time_ctx.limit_start
+			t *= period
 		} else {
-			t =
-				math.mod_f64(t, time_ctx.limit_end - time_ctx.limit_start) +
-				time_ctx.seconds_elapsed
+			t = math.mod_f64(t, period)
 		}
-	} else {
-		t += time_ctx.limit_start
 	}
+
+	t += time_ctx.limit_start
 
 	return t
 }
@@ -335,63 +338,20 @@ export :: proc(opts: ^Options) -> bool {
 	switch (ctx.export_image_type) {
 	case .GIF:
 	case .PNG:
-		draw(&ctx.image, &gl_ctx, &ctx.time, &ul)
-		out_size := ctx.image.width * ctx.image.height * 4
-		out := make([]byte, out_size)
-		gl.ReadPixels(0, 0, ctx.image.width, ctx.image.height, gl.RGBA, gl.UNSIGNED_BYTE, &out[0])
-		fmt.println("Successfully drew a frame to framebuffer and exported it to a byte array")
+		out := alloc_draw_to_byte_buffer(&ctx.image, &ctx.time, &gl_ctx, &ul)
+		defer delete(out)
 
-		// out_path, err := os.absolute_path_from_relative(opts.export_out)
-		// if err != nil {
-		// 	fmt.println("Error resolving out path:", err)
-		// 	return false
-		// }
+		ok: bool
+		handle: os.Handle
+		write_ctx: IOWriteContext
 
-		out_path := opts.export_out
-
-		file_exists := os.exists(out_path)
-		handle, err := os.open(out_path, os.O_WRONLY | os.O_CREATE)
-		if !file_exists {
-			err := os.fchmod(handle, os.S_IRUSR | os.S_IWUSR | os.S_IRGRP | os.S_IROTH)
-			if err != nil {
-				fmt.println("Error setting file permissions for exported file:", err)
-				return false
-			}
-		}
-		if err != nil {
-			fmt.println("Error opening file for writing:", opts.export_out, err)
+		ok, handle = open_rw_writer_create_if_notexists(opts.export_out)
+		if !ok {
 			return false
 		}
 		defer os.close(handle)
 
-		stream := os.stream_from_handle(handle)
-		writer, ok := io.to_writer(stream)
-
-		if !ok {
-			fmt.println("Unable to open write interface")
-			return false
-		}
-
-		WriteContext :: struct {
-			offset: int,
-			writer: io.Writer,
-		}
-		write_ctx: WriteContext = {
-			writer = writer,
-			offset = 0,
-		}
-
-		write_image_data :: proc "c" (ctx: rawptr, data: rawptr, size: c.int) {
-			context = runtime.default_context()
-			write_ctx := cast(^WriteContext)ctx
-			fmt.println("Got ", size, " bytes. Current offset = ", write_ctx.offset)
-			bytes := slice.bytes_from_ptr(data, int(size))
-			fmt.println("bytes len=", len(bytes))
-			_, err := io.write(write_ctx.writer, bytes, &write_ctx.offset)
-			if err != nil {
-				fmt.println("Write Error:", err)
-			}
-		}
+		ok, write_ctx = io_write_context_from_handle(handle)
 
 		image.flip_vertically_on_write(true)
 
@@ -412,6 +372,19 @@ export :: proc(opts: ^Options) -> bool {
 	}
 
 	return true
+}
+
+alloc_draw_to_byte_buffer :: proc(
+	image: ^ImageContext,
+	time_ctx: ^TimeContext,
+	gl_ctx: ^GLContext,
+	ul: ^UniformLocations,
+) -> []byte {
+	out_size := image.width * image.height * 4
+	out := make([]byte, out_size)
+	draw(image, gl_ctx, time_ctx, ul)
+	gl.ReadPixels(0, 0, image.width, image.height, gl.RGBA, gl.UNSIGNED_BYTE, &out[0])
+	return out
 }
 
 get_frag_shader_embedded :: proc(shader_type: ShaderType) -> string {
@@ -1072,4 +1045,51 @@ triangle_wave_f64 :: proc(amplitude: f64, period: f64, x: f64) -> f64 {
 		(4 * amplitude / period) * math.abs(proper_mod_f64(x - period / 4, period) - period / 2) -
 		amplitude \
 	)
+}
+
+open_rw_writer_create_if_notexists :: proc(path: string) -> (bool, os.Handle) {
+	file_exists := os.exists(path)
+	handle, err := os.open(path, os.O_WRONLY | os.O_CREATE)
+
+	if !file_exists {
+		err := os.fchmod(handle, os.S_IRUSR | os.S_IWUSR | os.S_IRGRP | os.S_IROTH)
+		if err != nil {
+			fmt.println("Error setting file permissions for exported file:", err)
+			return false, 0x00
+		}
+	}
+
+	if err != nil {
+		fmt.println("Error opening file for writing:", path, err)
+		return false, 0x00
+	}
+
+	return true, handle
+}
+
+write_image_data :: proc "c" (ctx: rawptr, data: rawptr, size: c.int) {
+	context = runtime.default_context()
+	write_ctx := cast(^IOWriteContext)ctx
+	bytes := slice.bytes_from_ptr(data, int(size))
+	_, err := io.write(write_ctx.writer, bytes, &write_ctx.offset)
+	if err != nil {
+		fmt.println("Write Error:", err)
+	}
+}
+
+io_write_context_from_handle :: proc(handle: os.Handle) -> (bool, IOWriteContext) {
+	stream := os.stream_from_handle(handle)
+	writer, ok := io.to_writer(stream)
+
+	if !ok {
+		fmt.println("Unable to open write interface")
+		return false, IOWriteContext{}
+	}
+
+	write_ctx: IOWriteContext = {
+		writer = writer,
+		offset = 0,
+	}
+
+	return true, write_ctx
 }
