@@ -14,12 +14,15 @@ import "core:encoding/json"
 import "core:flags"
 import "core:fmt"
 import "core:io"
+import "core:log"
 import "core:math"
 import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
+import "internal/gif"
+import "internal/lzw"
 import gl "vendor:OpenGL"
 import egl "vendor:egl"
 import "vendor:glfw"
@@ -27,11 +30,23 @@ import "vendor:stb/image"
 
 SHADER_HOT_RELOADING :: #config(SHADER_HOT_RELOADING, false)
 
+ColorBox :: struct {
+	start: int,
+	end:   int,
+}
+
 RgbColor :: struct {
 	r: f32,
 	g: f32,
 	b: f32,
 }
+
+URgbColor :: struct {
+	r: u8,
+	g: u8,
+	b: u8,
+}
+
 
 HsvColor :: struct {
 	h: f32,
@@ -123,6 +138,8 @@ ExportContext :: struct {
 	image:             ImageContext,
 	time:              TimeContext,
 	export_image_type: ExportImageType,
+	window:            glfw.WindowHandle,
+	out_path:          string,
 }
 
 ExportImageType :: enum {
@@ -147,6 +164,20 @@ ShaderType :: enum {
 	Monterrey2 = 2,
 }
 
+alloc_draw_to_byte_buffer :: proc(
+	image: ^ImageContext,
+	time_ctx: ^TimeContext,
+	gl_ctx: ^GLContext,
+	ul: ^UniformLocations,
+	format: u32,
+) -> []byte {
+	out_size := image.width * image.height * 3
+	out := make([]byte, out_size)
+	draw(image, gl_ctx, time_ctx, ul)
+	gl.ReadPixels(0, 0, image.width, image.height, format, gl.UNSIGNED_BYTE, &out[0])
+	return out
+}
+
 // Takes a value between 0 and 1 and interpolates it along a bezier curve
 bezier_blend :: proc {
 	bezier_blend_f32,
@@ -163,6 +194,22 @@ bezier_blend_f64 :: proc(t: f64) -> f64 {
 	return t * t * (3 - 2 * t)
 }
 
+build_uniform_palette :: proc() -> []u8 {
+	palette := make([]u8, 256 * 3)
+	i := 0
+	for r in 0 ..< 8 {
+		for g in 0 ..< 8 {
+			for b in 0 ..< 4 {
+				palette[i + 0] = u8(r * 255 / 7)
+				palette[i + 1] = u8(g * 255 / 7)
+				palette[i + 2] = u8(b * 255 / 3)
+				i += 3
+			}
+		}
+	}
+	return palette
+}
+
 calc_time_uniform :: proc(time_ctx: ^TimeContext) -> f64 {
 	t := time_ctx.seconds_elapsed
 	period := time_ctx.limit_end - time_ctx.limit_start
@@ -176,7 +223,7 @@ calc_time_uniform :: proc(time_ctx: ^TimeContext) -> f64 {
 			}
 			t *= period
 		} else {
-			t = math.mod_f64(t, period)
+			t = math.mod(t, period)
 		}
 	}
 
@@ -231,12 +278,13 @@ export :: proc(opts: ^Options) -> bool {
 		return false
 	}
 
-	out := "wallpaper.png"
 	if opts.export_out != "" {
-		out = opts.export_out
+		ctx.out_path = opts.export_out
+	} else {
+		ctx.out_path = "wallpaper.png"
 	}
 
-	out_rev := strings.reverse(out)
+	out_rev := strings.reverse(ctx.out_path)
 	part_rev, _ := strings.split_iterator(&out_rev, ".")
 	part := strings.to_lower(strings.reverse(part_rev))
 
@@ -252,7 +300,6 @@ export :: proc(opts: ^Options) -> bool {
 		os.exit(1)
 	}
 
-	fmt.println("part:", part)
 
 	if (glfw.Init() != true) {
 		fmt.println("Failed to initialize GLFW")
@@ -278,20 +325,21 @@ export :: proc(opts: ^Options) -> bool {
 	glfw.WindowHint(glfw.CONTEXT_VERSION_MAJOR, GL_MAJOR_VERSION)
 	glfw.WindowHint(glfw.CONTEXT_VERSION_MINOR, GL_MINOR_VERSION)
 	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+	glfw.WindowHint(glfw.FOCUSED, glfw.FALSE)
 
 	if (ODIN_OS == .Darwin) {
 		glfw.WindowHint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
 	}
 
-	window := glfw.CreateWindow(ctx.image.width, ctx.image.height, PROGRAMNAME, nil, nil)
-	if window == nil {
+	ctx.window = glfw.CreateWindow(ctx.image.width, ctx.image.height, PROGRAMNAME, nil, nil)
+	if ctx.window == nil {
 		fmt.println("Unable to create window")
 		return false
 	}
-	defer glfw.DestroyWindow(window)
+	defer glfw.DestroyWindow(ctx.window)
 
-	glfw.HideWindow(window)
-	glfw.MakeContextCurrent(window)
+	glfw.HideWindow(ctx.window)
+	glfw.MakeContextCurrent(ctx.window)
 	glfw.SwapInterval(1)
 
 	gl.load_up_to(int(GL_MAJOR_VERSION), GL_MINOR_VERSION, glfw.gl_set_proc_address)
@@ -337,54 +385,144 @@ export :: proc(opts: ^Options) -> bool {
 
 	switch (ctx.export_image_type) {
 	case .GIF:
+		return export_gif(&ctx, &gl_ctx, &ul)
 	case .PNG:
-		out := alloc_draw_to_byte_buffer(&ctx.image, &ctx.time, &gl_ctx, &ul)
-		defer delete(out)
-
-		ok: bool
-		handle: os.Handle
-		write_ctx: IOWriteContext
-
-		ok, handle = open_rw_writer_create_if_notexists(opts.export_out)
-		if !ok {
-			return false
-		}
-		defer os.close(handle)
-
-		ok, write_ctx = io_write_context_from_handle(handle)
-
-		image.flip_vertically_on_write(true)
-
-		write_result := image.write_png_to_func(
-			write_image_data,
-			&write_ctx,
-			ctx.image.width,
-			ctx.image.height,
-			4,
-			&out[0],
-			4 * ctx.image.width,
-		)
-
-		if write_result != 1 {
-			fmt.println("Warning: Got a non-successful write result from write_png_to_func")
-		}
+		return export_png(&ctx, &gl_ctx, &ul)
 	case .HEIC:
+		return export_heic(&ctx, &gl_ctx, &ul)
 	}
 
 	return true
 }
 
-alloc_draw_to_byte_buffer :: proc(
-	image: ^ImageContext,
-	time_ctx: ^TimeContext,
-	gl_ctx: ^GLContext,
-	ul: ^UniformLocations,
-) -> []byte {
-	out_size := image.width * image.height * 4
-	out := make([]byte, out_size)
-	draw(image, gl_ctx, time_ctx, ul)
-	gl.ReadPixels(0, 0, image.width, image.height, gl.RGBA, gl.UNSIGNED_BYTE, &out[0])
-	return out
+export_gif :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocations) -> bool {
+	EXPORT_FORMAT :: gl.RGB
+
+	if ctx.time.limit_end == 0 {
+		fmt.println("Can't export GIF without a known end time, please specifiy -seconds-end")
+		return false
+	}
+
+	writer_inited := false
+	writer: gif.GifWriter
+	palette: []u8
+
+	defer {
+		if palette != nil {
+			delete(palette)
+		}
+	}
+
+	PER_FRAME_DELAY :: 3
+
+	gif_opts := gif.GifOpts {
+		delay = PER_FRAME_DELAY,
+	}
+
+	for i in 0 ..< 5 {
+		fmt.println("Generating frame ", i, " @ time ", ctx.time.seconds_elapsed)
+		glfw.MakeContextCurrent(ctx.window)
+
+		ctx.time.start = time.tick_now()
+		image_bytes := alloc_draw_to_byte_buffer(&ctx.image, &ctx.time, gl_ctx, ul, EXPORT_FORMAT)
+		defer delete(image_bytes)
+
+		vert_flip_image(image_bytes, int(ctx.image.width))
+
+		if writer_inited == false {
+			palette = median_cut_quantize(image_bytes, 256)
+
+			err: runtime.Allocator_Error
+			err, writer = gif.writer_create(
+				8,
+				palette,
+				uint(ctx.image.width),
+				uint(ctx.image.height),
+			)
+			if err != nil {
+				fmt.println("Error initializing GIF writer, exiting")
+				return false
+			}
+			writer_inited = true
+		}
+
+		ctx.time.delta_ns = 1_000_000_000
+
+		gif.writer_push(
+			&writer,
+			&gif_opts,
+			0,
+			0,
+			uint(ctx.image.width),
+			uint(ctx.image.height),
+			image_bytes,
+		)
+
+		log.info("Writer push successful")
+
+		glfw.SwapBuffers(ctx.window)
+
+		ctx.time.seconds_elapsed += 1
+	}
+
+	out_len: uint = 0
+
+	fmt.println("Closing GIF writer and outputing result to buffer")
+	out := gif.writer_end(&writer, &out_len)
+	defer delete(out)
+
+	write_err := os.write_entire_file_or_err(ctx.out_path, out)
+
+	if write_err != nil {
+		fmt.println("Error writing GIF file:", write_err)
+		return false
+	}
+
+	fmt.println("Wrote file to disk OK")
+
+	return true
+}
+
+export_heic :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocations) -> bool {
+	fmt.println("ERROR: Not implemented: HEIC export")
+	return false
+}
+export_png :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocations) -> bool {
+	EXPORT_FORMAT :: gl.RGB
+	EXPORT_FORMAT_CHANNEL_SIZE :: 3
+
+	out := alloc_draw_to_byte_buffer(&ctx.image, &ctx.time, gl_ctx, ul, gl.RGB)
+	defer delete(out)
+
+	ok: bool
+	handle: os.Handle
+	write_ctx: IOWriteContext
+
+	ok, handle = open_rw_writer_create_if_notexists(ctx.out_path)
+	if !ok {
+		return false
+	}
+	defer os.close(handle)
+
+	ok, write_ctx = io_write_context_from_handle(handle)
+
+	image.flip_vertically_on_write(true)
+
+	write_result := image.write_png_to_func(
+		write_image_data,
+		&write_ctx,
+		ctx.image.width,
+		ctx.image.height,
+		EXPORT_FORMAT_CHANNEL_SIZE,
+		&out[0],
+		EXPORT_FORMAT_CHANNEL_SIZE * ctx.image.width,
+	)
+
+	if write_result != 1 {
+		fmt.println("Warning: Got a non-successful write result from write_png_to_func")
+	}
+
+	return true
 }
 
 get_frag_shader_embedded :: proc(shader_type: ShaderType) -> string {
@@ -573,6 +711,22 @@ hex_to_col :: proc(hex: string) -> (bool, RgbColor) {
 	return true, color
 }
 
+io_write_context_from_handle :: proc(handle: os.Handle) -> (bool, IOWriteContext) {
+	stream := os.stream_from_handle(handle)
+	writer, ok := io.to_writer(stream)
+
+	if !ok {
+		fmt.println("Unable to open write interface")
+		return false, IOWriteContext{}
+	}
+
+	write_ctx: IOWriteContext = {
+		writer = writer,
+		offset = 0,
+	}
+
+	return true, write_ctx
+}
 key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
 	if key == glfw.KEY_ESCAPE {
 		running = false
@@ -622,6 +776,10 @@ main :: proc() {
 		os.exit(1)
 	}
 
+	if opts.boomerang && opts.seconds_end == 0 {
+		fmt.println("Error: --seconds-end must be defined when using --boomerang")
+	}
+
 	ok := load_config()
 	if !ok {
 		fmt.println("Error loading initial config, falling back to application defaults")
@@ -654,6 +812,130 @@ main :: proc() {
 
 	fmt.println("Successfully exited")
 	os.exit(0)
+}
+
+median_cut_quantize :: proc(pixels: []u8, max_colors: int) -> []u8 {
+	num_pixels := len(pixels) / 3
+	if num_pixels == 0 {
+		return nil
+	}
+
+	colors := make([]URgbColor, num_pixels)
+	defer delete(colors)
+	for i in 0 ..< num_pixels {
+		colors[i] = URgbColor {
+			r = pixels[i * 3 + 0],
+			g = pixels[i * 3 + 1],
+			b = pixels[i * 3 + 2],
+		}
+	}
+
+	boxes := make([dynamic]ColorBox, 0, max_colors)
+	defer delete(boxes)
+
+	append(&boxes, ColorBox{start = 0, end = num_pixels})
+
+	sort_component :: proc(arr: []URgbColor, start, end: int, channel: string) {
+		s := arr[start:end]
+		switch channel {
+		case "r":
+			slice.sort_by(s, proc(a, b: URgbColor) -> bool {return a.r < b.r})
+		case "g":
+			slice.sort_by(s, proc(a, b: URgbColor) -> bool {return a.g < b.g})
+		case "b":
+			slice.sort_by(s, proc(a, b: URgbColor) -> bool {return a.b < b.b})
+		}
+	}
+
+	for len(boxes) < max_colors {
+		// Find the box with the most pixels
+		longest := 0
+		for i in 1 ..< len(boxes) {
+			if (boxes[i].end - boxes[i].start) > (boxes[longest].end - boxes[longest].start) {
+				longest = i
+			}
+		}
+
+		box := boxes[longest]
+		count := box.end - box.start
+		if count <= 1 {
+			break
+		}
+
+		// Find channel with greatest range
+		rmin, rmax: u8 = 255, 0
+		gmin, gmax: u8 = 255, 0
+		bmin, bmax: u8 = 255, 0
+		for i in box.start ..< box.end {
+			c := colors[i]
+			if c.r < rmin {rmin = c.r}
+			if c.r > rmax {rmax = c.r}
+			if c.g < gmin {gmin = c.g}
+			if c.g > gmax {gmax = c.g}
+			if c.b < bmin {bmin = c.b}
+			if c.b > bmax {bmax = c.b}
+		}
+		dr := rmax - rmin
+		dg := gmax - gmin
+		db := bmax - bmin
+
+		channel := "r"
+		if dg > dr && dg >= db {
+			channel = "g"
+		} else if db > dr && db >= dg {
+			channel = "b"
+		}
+
+		// Sort and split at median
+		sort_component(colors, box.start, box.end, channel)
+		mid := (box.start + box.end) / 2
+
+		// Replace box with two halves
+		boxes[longest] = ColorBox {
+			start = box.start,
+			end   = mid,
+		}
+		append(&boxes, ColorBox{start = mid, end = box.end})
+	}
+
+	palette := make([]u8, len(boxes) * 3)
+
+	for box, i in boxes {
+		r_total, g_total, b_total := 0, 0, 0
+		count := box.end - box.start
+		for j in box.start ..< box.end {
+			c := colors[j]
+			r_total += int(c.r)
+			g_total += int(c.g)
+			b_total += int(c.b)
+		}
+		if count == 0 {count = 1} 	// prevent div by 0
+		palette[i * 3 + 0] = u8(r_total / count)
+		palette[i * 3 + 1] = u8(g_total / count)
+		palette[i * 3 + 2] = u8(b_total / count)
+	}
+
+	return palette
+}
+
+open_rw_writer_create_if_notexists :: proc(path: string) -> (bool, os.Handle) {
+	file_exists := os.exists(path)
+	handle, err := os.open(path, os.O_WRONLY | os.O_CREATE)
+
+	if !file_exists {
+		err := os.fchmod(handle, os.S_IRUSR | os.S_IWUSR | os.S_IRGRP | os.S_IROTH)
+		if err != nil {
+			fmt.println("Error setting file permissions for exported file:", err)
+			return false, 0x00
+		}
+	}
+
+	if err != nil {
+		fmt.println("Error opening file for writing:", path, err)
+		return false, 0x00
+	}
+
+	return true, handle
 }
 
 parse_config :: proc(data: []byte) -> (bool, Config) {
@@ -732,11 +1014,17 @@ parse_shader :: proc(shader_str: string) -> ShaderType {
 	}
 }
 
-proper_mod_f32 :: proc(dividend: f32, divisor: f32) -> f32 {
-	return math.mod_f32(math.mod_f32(dividend, divisor) + divisor, divisor)
+proper_mod :: proc {
+	proper_mod_f32,
+	proper_mod_f64,
 }
+
+proper_mod_f32 :: proc(dividend: f32, divisor: f32) -> f32 {
+	return math.mod(math.mod(dividend, divisor) + divisor, divisor)
+}
+
 proper_mod_f64 :: proc(dividend: f64, divisor: f64) -> f64 {
-	return math.mod_f64(math.mod_f64(dividend, divisor) + divisor, divisor)
+	return math.mod(math.mod(dividend, divisor) + divisor, divisor)
 }
 
 replace_envs_in_str :: proc(str: string) -> string {
@@ -1034,37 +1322,39 @@ triangle_wave :: proc {
 	triangle_wave_f32,
 	triangle_wave_f64,
 }
+
 triangle_wave_f32 :: proc(amplitude: f32, period: f32, x: f32) -> f32 {
 	return(
-		(4 * amplitude / period) * math.abs(proper_mod_f32(x - period / 4, period) - period / 2) -
+		(4 * amplitude / period) * math.abs(proper_mod(x - period / 4, period) - period / 2) -
 		amplitude \
 	)
 }
 triangle_wave_f64 :: proc(amplitude: f64, period: f64, x: f64) -> f64 {
 	return(
-		(4 * amplitude / period) * math.abs(proper_mod_f64(x - period / 4, period) - period / 2) -
+		(4 * amplitude / period) * math.abs(proper_mod(x - period / 4, period) - period / 2) -
 		amplitude \
 	)
 }
 
-open_rw_writer_create_if_notexists :: proc(path: string) -> (bool, os.Handle) {
-	file_exists := os.exists(path)
-	handle, err := os.open(path, os.O_WRONLY | os.O_CREATE)
-
-	if !file_exists {
-		err := os.fchmod(handle, os.S_IRUSR | os.S_IWUSR | os.S_IRGRP | os.S_IROTH)
-		if err != nil {
-			fmt.println("Error setting file permissions for exported file:", err)
-			return false, 0x00
+vert_flip_image :: proc(img_data: []u8, width: int) {
+	height := int(math.floor(f32(len(img_data) / width / 3)))
+	for bottom_row in 0 ..< (height / 2) {
+		top_row := height - bottom_row - 1
+		if top_row == bottom_row {
+			break
+		}
+		for j in 0 ..< width {
+			bottom_cell := (bottom_row * width * 3) + (j * 3)
+			top_cell := (top_row * width * 3) + (j * 3)
+			for c in 0 ..< 3 {
+				bottom_color := bottom_cell + c
+				top_color := top_cell + c
+				t := img_data[top_color]
+				img_data[top_color] = img_data[bottom_color]
+				img_data[bottom_color] = t
+			}
 		}
 	}
-
-	if err != nil {
-		fmt.println("Error opening file for writing:", path, err)
-		return false, 0x00
-	}
-
-	return true, handle
 }
 
 write_image_data :: proc "c" (ctx: rawptr, data: rawptr, size: c.int) {
@@ -1075,21 +1365,4 @@ write_image_data :: proc "c" (ctx: rawptr, data: rawptr, size: c.int) {
 	if err != nil {
 		fmt.println("Write Error:", err)
 	}
-}
-
-io_write_context_from_handle :: proc(handle: os.Handle) -> (bool, IOWriteContext) {
-	stream := os.stream_from_handle(handle)
-	writer, ok := io.to_writer(stream)
-
-	if !ok {
-		fmt.println("Unable to open write interface")
-		return false, IOWriteContext{}
-	}
-
-	write_ctx: IOWriteContext = {
-		writer = writer,
-		offset = 0,
-	}
-
-	return true, write_ctx
 }

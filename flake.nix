@@ -51,11 +51,22 @@
         default = mkShell {
           inherit buildInputs;
 
-          packages = [
-            clang
-            ols
-            odin_override
-          ];
+          packages =
+            [
+              clang
+              ols
+              odin_override
+              clang-tools
+              llvm_17
+              lldb_17
+              bear
+              stdmanpages
+            ]
+            ++ (with llvmPackages_17; [
+              clang-manpages
+              llvm-manpages
+              lldb-manpages
+            ]);
         };
       };
     }));

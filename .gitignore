@@ -2,3 +2,7 @@
 build
 result
 dynawall
+*.dSYM
+*.png
+*.gif
+*.heic
