@@ -379,13 +379,11 @@ bw_deinit :: proc(b: ^BitWriter) {
 }
 
 bw_pack :: proc(b: ^BitWriter, n_bits: u8, bits: uint) {
-	mask: u32
-
 	if (b == nil) {
 		return
 	}
 
-	mask = gen_mask(uint(n_bits))
+	mask := gen_mask(uint(n_bits))
 	mask <<= b.pos
 	b.bits |= u32(bits << b.pos) & mask
 	b.pos += n_bits
@@ -480,6 +478,10 @@ compress :: proc(bit_size: byte, src: []byte, gif_format: bool) -> (CompressErro
 	return nil, bw_result(&b)
 }
 
+compress_gif :: proc(bit_size: u8, src: []u8) -> (CompressError, [dynamic]u8) {
+	return compress(bit_size, src, true)
+}
+
 debug_print_table :: proc(table: ^Table) {
 	EntryWithIndex :: struct {
 		entry: Entry,
@@ -514,11 +516,6 @@ debug_print_table :: proc(table: ^Table) {
 			ei.entry.prev,
 		)
 	}
-}
-
-
-compress_gif :: proc(bit_size: u8, src: []u8) -> (CompressError, [dynamic]u8) {
-	return compress(bit_size, src, true)
 }
 
 decompress :: proc(bit_size: u8, src: []byte) -> (DecompressError, [dynamic]u8) {
@@ -734,6 +731,7 @@ table_create :: proc(type: TableType, bit_size: u8) -> Table {
 	len: uint = 1 << bit_size
 	t := Table{}
 	t.type = type
+
 	if t.type == .LZW_TABLE_COMPRESS {
 		t.size = LZW_MAX_ENTRIES * 4 / 3
 		t.entries = make([]Entry, t.size)
@@ -742,6 +740,7 @@ table_create :: proc(type: TableType, bit_size: u8) -> Table {
 	} else {
 		t.entries = make([]Entry, LZW_MAX_ENTRIES)
 	}
+
 	for i: uint = 0; i < len + 2; i += 1 {
 		e := Entry{}
 		e.len = 1
@@ -750,7 +749,6 @@ table_create :: proc(type: TableType, bit_size: u8) -> Table {
 		e.val = byte(i)
 		table_add(&t, &e)
 	}
-
 
 	return t
 }

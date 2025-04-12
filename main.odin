@@ -28,25 +28,45 @@ import egl "vendor:egl"
 import "vendor:glfw"
 import "vendor:stb/image"
 
+GL_MAJOR_VERSION: c.int : 3
+CONFIG_FILE_TEMPLATE :: #load("./dynawall.conf.tmpl")
+FRAME_LIMIT :: 24
+GL_MINOR_VERSION :: 3
+NANOSECONDS_PER_SECOND :: 1000 * 1000 * 1000
+PROGRAMNAME :: "Dynawall"
 SHADER_HOT_RELOADING :: #config(SHADER_HOT_RELOADING, false)
+
+config: Config
+config_file: string
+running: b32 = true
 
 ColorBox :: struct {
 	start: int,
 	end:   int,
 }
 
-RgbColor :: struct {
-	r: f32,
-	g: f32,
-	b: f32,
+Config :: struct {
+	palette: Palette,
+	shader:  ShaderType,
 }
 
-URgbColor :: struct {
-	r: u8,
-	g: u8,
-	b: u8,
+ExportContext :: struct {
+	image:             ImageContext,
+	time:              TimeContext,
+	export_image_type: ExportImageType,
+	window:            glfw.WindowHandle,
+	out_path:          string,
 }
 
+GLContext :: struct {
+	vao:                    u32,
+	vbo:                    u32,
+	ebo:                    u32,
+	program:                u32,
+	shader_type:            ShaderType,
+	hot_reload_shader_path: string,
+	hot_reload_shader_ts:   i64,
+}
 
 HsvColor :: struct {
 	h: f32,
@@ -54,13 +74,14 @@ HsvColor :: struct {
 	v: f32,
 }
 
-Palette :: struct {
-	accents_rgb:  [10]RgbColor,
-	accents_hsv:  [10]HsvColor,
-	accents_size: u32,
-	bg_rgb:       RgbColor,
-	bg_hsv:       HsvColor,
-	is_dark:      bool,
+IOWriteContext :: struct {
+	offset: int,
+	writer: io.Writer,
+}
+
+ImageContext :: struct {
+	width:  i32,
+	height: i32,
 }
 
 Options :: struct {
@@ -75,27 +96,42 @@ Options :: struct {
 	boomerang:        bool `usage:"activates boomerang mode if --seconds-end is set. Makes the shader plot against a bezier triangle function of the time value, so that time periodically and smoothly returns to 0"`,
 }
 
-Config :: struct {
-	palette: Palette,
-	shader:  ShaderType,
+Palette :: struct {
+	accents_rgb:  [10]RgbColor,
+	accents_hsv:  [10]HsvColor,
+	accents_size: u32,
+	bg_rgb:       RgbColor,
+	bg_hsv:       HsvColor,
+	is_dark:      bool,
 }
 
-IOWriteContext :: struct {
-	offset: int,
-	writer: io.Writer,
+RgbColor :: struct {
+	r: f32,
+	g: f32,
+	b: f32,
 }
 
+ServeContext :: struct {
+	image:  ImageContext,
+	time:   TimeContext,
+	window: glfw.WindowHandle,
+	frame:  i32,
+}
 
-PROGRAMNAME :: "Dynawall"
-FRAME_LIMIT :: 24
-NANOSECONDS_PER_SECOND :: 1000 * 1000 * 1000
-GL_MAJOR_VERSION: c.int : 3
-GL_MINOR_VERSION :: 3
-CONFIG_FILE_TEMPLATE :: #load("./dynawall.conf.tmpl")
+TimeContext :: struct {
+	boomerang:              bool,
+	local_time:             f32,
+	delta:                  f64,
+	seconds_elapsed:        f64,
+	time_cyclic:            f64,
+	limit_start, limit_end: f64,
+}
 
-running: b32 = true
-config: Config
-config_file: string
+URgbColor :: struct {
+	r: u8,
+	g: u8,
+	b: u8,
+}
 
 UniformLocations :: struct {
 	time_location:         i32,
@@ -110,52 +146,10 @@ UniformLocations :: struct {
 	mouse_location:        i32,
 }
 
-TimeContext :: struct {
-	boomerang:              bool,
-	local_time:             f32,
-	start, end:             time.Tick,
-	delta_ns:               time.Duration,
-	delta:                  f64,
-	seconds_elapsed:        f64,
-	frame_time:             f64,
-	time_cyclic:            f64,
-	limit_start, limit_end: f64,
-}
-
-ImageContext :: struct {
-	width:  i32,
-	height: i32,
-}
-
-ServeContext :: struct {
-	image:  ImageContext,
-	time:   TimeContext,
-	window: glfw.WindowHandle,
-	frame:  i32,
-}
-
-ExportContext :: struct {
-	image:             ImageContext,
-	time:              TimeContext,
-	export_image_type: ExportImageType,
-	window:            glfw.WindowHandle,
-	out_path:          string,
-}
-
 ExportImageType :: enum {
 	GIF,
 	PNG,
 	HEIC,
-}
-
-GLContext :: struct {
-	vao:                    u32,
-	vbo:                    u32,
-	ebo:                    u32,
-	program:                u32,
-	shader_type:            ShaderType,
-	hot_reload_shader_path: string,
-	hot_reload_shader_ts:   i64,
 }
 
 ShaderType :: enum {
@@ -164,17 +158,19 @@ ShaderType :: enum {
 	Monterrey2 = 2,
 }
 
+
 alloc_draw_to_byte_buffer :: proc(
-	image: ^ImageContext,
+	img_ctx: ^ImageContext,
 	time_ctx: ^TimeContext,
 	gl_ctx: ^GLContext,
 	ul: ^UniformLocations,
 	format: u32,
-) -> []byte {
-	out_size := image.width * image.height * 3
+	channel_count: i32,
+) -> []u8 {
+	out_size := img_ctx.width * img_ctx.height * channel_count
 	out := make([]byte, out_size)
-	draw(image, gl_ctx, time_ctx, ul)
-	gl.ReadPixels(0, 0, image.width, image.height, format, gl.UNSIGNED_BYTE, &out[0])
+	draw(img_ctx, gl_ctx, time_ctx, ul)
+	gl.ReadPixels(0, 0, img_ctx.width, img_ctx.height, format, gl.UNSIGNED_BYTE, &out[0])
 	return out
 }
 
@@ -183,11 +179,13 @@ bezier_blend :: proc {
 	bezier_blend_f32,
 	bezier_blend_f64,
 }
+
 bezier_blend_f32 :: proc(t: f32) -> f32 {
 	assert(t >= 0)
 	assert(t <= 1)
 	return t * t * (3 - 2 * t)
 }
+
 bezier_blend_f64 :: proc(t: f64) -> f64 {
 	assert(t >= 0)
 	assert(t <= 1)
@@ -234,7 +232,6 @@ calc_time_uniform :: proc(time_ctx: ^TimeContext) -> f64 {
 
 create_time_ctx :: proc(opts: ^Options) -> (bool, TimeContext) {
 	time_ctx := TimeContext{}
-	time_ctx.start = time.tick_now()
 	time_ctx.limit_start = opts.seconds_start
 	time_ctx.limit_end = opts.seconds_end
 	time_ctx.boomerang = opts.boomerang
@@ -296,7 +293,7 @@ export :: proc(opts: ^Options) -> bool {
 	case "heic":
 		ctx.export_image_type = .HEIC
 	case:
-		fmt.println("Error: Unknwon output file format:", part)
+		fmt.println("Error: Unknown output file format:", part)
 		os.exit(1)
 	}
 
@@ -397,56 +394,80 @@ export :: proc(opts: ^Options) -> bool {
 
 export_gif :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocations) -> bool {
 	EXPORT_FORMAT :: gl.RGB
+	EXPORT_FORMAT_CHANNEL_SIZE :: 3
+	PER_FRAME_DELAY_CENTISECONDS: f64 : 6
+	PER_FRAME_DELAY_SECONDS: f64 : PER_FRAME_DELAY_CENTISECONDS / 100
 
 	if ctx.time.limit_end == 0 {
 		fmt.println("Can't export GIF without a known end time, please specifiy -seconds-end")
 		return false
 	}
 
-	writer_inited := false
-	writer: gif.GifWriter
-	palette: []u8
+	// Create writer without global color table
+	err, writer := gif.writer_create(8, nil, uint(ctx.image.width), uint(ctx.image.height))
+	if err != nil {
+		fmt.println("Error initializing GIF writer, exiting")
+		return false
+	}
 
+	period := ctx.time.limit_end - ctx.time.limit_start
+	if ctx.time.boomerang {
+		period *= 2
+	}
+
+	ctx.time.seconds_elapsed = 0
+
+	total_frames := int(math.ceil(period / PER_FRAME_DELAY_SECONDS))
+
+	last_bytes: []u8
 	defer {
-		if palette != nil {
-			delete(palette)
+		if last_bytes != nil {
+			delete(last_bytes)
 		}
 	}
 
-	PER_FRAME_DELAY :: 3
+	for frame_number in 1 ..= total_frames {
+		fmt.println(
+			"Generating frame ",
+			frame_number,
+			"/",
+			total_frames,
+			" @ time ",
+			ctx.time.seconds_elapsed,
+		)
 
-	gif_opts := gif.GifOpts {
-		delay = PER_FRAME_DELAY,
-	}
-
-	for i in 0 ..< 5 {
-		fmt.println("Generating frame ", i, " @ time ", ctx.time.seconds_elapsed)
 		glfw.MakeContextCurrent(ctx.window)
 
-		ctx.time.start = time.tick_now()
-		image_bytes := alloc_draw_to_byte_buffer(&ctx.image, &ctx.time, gl_ctx, ul, EXPORT_FORMAT)
-		defer delete(image_bytes)
+		transparent_color_flag := last_bytes != nil
+
+		gif_opts := gif.GifOpts {
+			delay = uint(PER_FRAME_DELAY_CENTISECONDS),
+			trans_index = 0,
+			flags = {transparent_color = transparent_color_flag},
+		}
+
+		image_bytes := alloc_draw_to_byte_buffer(
+			&ctx.image,
+			&ctx.time,
+			gl_ctx,
+			ul,
+			EXPORT_FORMAT,
+			EXPORT_FORMAT_CHANNEL_SIZE,
+		)
 
 		vert_flip_image(image_bytes, int(ctx.image.width))
 
-		if writer_inited == false {
-			palette = median_cut_quantize(image_bytes, 256)
+		pixels := get_pixels(last_bytes, image_bytes, ctx.image.width, ctx.image.height)
+		defer delete(pixels)
 
-			err: runtime.Allocator_Error
-			err, writer = gif.writer_create(
-				8,
-				palette,
-				uint(ctx.image.width),
-				uint(ctx.image.height),
-			)
-			if err != nil {
-				fmt.println("Error initializing GIF writer, exiting")
-				return false
-			}
-			writer_inited = true
+		if last_bytes != nil {
+			delete(last_bytes)
 		}
+		last_bytes = image_bytes
 
-		ctx.time.delta_ns = 1_000_000_000
+		// Local color table
+		palette := median_cut_quantize(pixels, 256)
+		defer delete(palette)
 
 		gif.writer_push(
 			&writer,
@@ -455,14 +476,17 @@ export_gif :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocation
 			0,
 			uint(ctx.image.width),
 			uint(ctx.image.height),
-			image_bytes,
+			pixels,
+			8,
+			palette,
 		)
 
 		log.info("Writer push successful")
 
 		glfw.SwapBuffers(ctx.window)
 
-		ctx.time.seconds_elapsed += 1
+		ctx.time.delta = PER_FRAME_DELAY_SECONDS
+		ctx.time.seconds_elapsed = min(period, ctx.time.seconds_elapsed + PER_FRAME_DELAY_SECONDS)
 	}
 
 	out_len: uint = 0
@@ -487,11 +511,19 @@ export_heic :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocatio
 	fmt.println("ERROR: Not implemented: HEIC export")
 	return false
 }
+
 export_png :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocations) -> bool {
 	EXPORT_FORMAT :: gl.RGB
 	EXPORT_FORMAT_CHANNEL_SIZE :: 3
 
-	out := alloc_draw_to_byte_buffer(&ctx.image, &ctx.time, gl_ctx, ul, gl.RGB)
+	out := alloc_draw_to_byte_buffer(
+		&ctx.image,
+		&ctx.time,
+		gl_ctx,
+		ul,
+		EXPORT_FORMAT,
+		EXPORT_FORMAT_CHANNEL_SIZE,
+	)
 	defer delete(out)
 
 	ok: bool
@@ -525,6 +557,48 @@ export_png :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocation
 	return true
 }
 
+get_pixels :: proc(prev: []u8, next: []u8, width: i32, height: i32) -> []gif.RgbPixel {
+	out := make([]gif.RgbPixel, width * height * 3)
+
+	for i in 0 ..< height {
+		for j in 0 ..< width {
+			index := (i * width) + j
+			byte_offset := 3 * index
+
+			if prev == nil {
+				out[index] = gif.RgbPixel {
+					is_transparent = false,
+					r              = next[byte_offset],
+					g              = next[byte_offset + 1],
+					b              = next[byte_offset + 2],
+				}
+
+				continue
+			}
+
+			if prev[byte_offset] == next[byte_offset] &&
+			   prev[byte_offset + 1] == next[byte_offset + 1] &&
+			   prev[byte_offset + 2] == next[byte_offset + 2] {
+				out[index] = gif.RgbPixel {
+					is_transparent = true,
+					r              = 0,
+					g              = 0,
+					b              = 0,
+				}
+				continue
+			}
+
+			out[index] = gif.RgbPixel {
+				is_transparent = false,
+				r              = next[byte_offset],
+				g              = next[byte_offset + 1],
+				b              = next[byte_offset + 2],
+			}
+		}
+	}
+
+	return out
+}
 get_frag_shader_embedded :: proc(shader_type: ShaderType) -> string {
 	bytes: []byte
 	switch (shader_type) {
@@ -621,7 +695,6 @@ get_vert_shader_path :: proc(shader_type: ShaderType) -> string {
 gl_setup :: proc() -> (bool, GLContext) {
 	gl_ctx := GLContext{}
 
-	fmt.println("loading program for", config.shader)
 	program_ok, program := get_shader_prog(config.shader)
 	if !program_ok {
 		return false, GLContext{}
@@ -814,8 +887,8 @@ main :: proc() {
 	os.exit(0)
 }
 
-median_cut_quantize :: proc(pixels: []u8, max_colors: int) -> []u8 {
-	num_pixels := len(pixels) / 3
+median_cut_quantize :: proc(pixels: []gif.RgbPixel, max_colors: int) -> []u8 {
+	num_pixels := len(pixels)
 	if num_pixels == 0 {
 		return nil
 	}
@@ -823,10 +896,14 @@ median_cut_quantize :: proc(pixels: []u8, max_colors: int) -> []u8 {
 	colors := make([]URgbColor, num_pixels)
 	defer delete(colors)
 	for i in 0 ..< num_pixels {
+		if pixels[i].is_transparent {
+			continue
+		}
+
 		colors[i] = URgbColor {
-			r = pixels[i * 3 + 0],
-			g = pixels[i * 3 + 1],
-			b = pixels[i * 3 + 2],
+			r = pixels[i].r,
+			g = pixels[i].g,
+			b = pixels[i].b,
 		}
 	}
 
@@ -1185,6 +1262,8 @@ serve_update :: proc(ctx: ^ServeContext, gl_ctx: ^GLContext, ul: ^UniformLocatio
 		return
 	}
 
+	frame_time_start := time.tick_now()
+
 	if ctx.frame == 0 {
 		if gl_ctx.shader_type != config.shader {
 			fmt.println("Shader type changed in config, loading new shader")
@@ -1230,8 +1309,6 @@ serve_update :: proc(ctx: ^ServeContext, gl_ctx: ^GLContext, ul: ^UniformLocatio
 
 	glfw.MakeContextCurrent(ctx.window)
 
-	ctx.time.start = time.tick_now()
-
 	ctx.image.width, ctx.image.height = glfw.GetFramebufferSize(ctx.window)
 	ctx.time.seconds_elapsed = glfw.GetTime()
 
@@ -1241,19 +1318,18 @@ serve_update :: proc(ctx: ^ServeContext, gl_ctx: ^GLContext, ul: ^UniformLocatio
 
 	glfw.PollEvents()
 
-	ctx.time.end = time.tick_now()
-
-	ctx.time.delta_ns = time.tick_diff(ctx.time.start, ctx.time.end)
+	frame_time_end := time.tick_now()
+	delta_ns := time.tick_diff(frame_time_start, frame_time_end)
 
 	if (FRAME_LIMIT > 0) {
-		if (ctx.time.delta_ns < NANOSECONDS_PER_SECOND) {
-			time.sleep((NANOSECONDS_PER_SECOND / FRAME_LIMIT) - ctx.time.delta_ns)
+		if (delta_ns < NANOSECONDS_PER_SECOND) {
+			time.sleep((NANOSECONDS_PER_SECOND / FRAME_LIMIT) - delta_ns)
 			ctx.time.delta = 1 / FRAME_LIMIT
 		} else {
-			ctx.time.delta = f64(ctx.time.delta_ns / NANOSECONDS_PER_SECOND)
+			ctx.time.delta = f64(delta_ns / NANOSECONDS_PER_SECOND)
 		}
 	} else {
-		ctx.time.delta = f64(ctx.time.delta_ns / NANOSECONDS_PER_SECOND)
+		ctx.time.delta = f64(delta_ns / NANOSECONDS_PER_SECOND)
 	}
 	ctx.frame = (ctx.frame + 1) % FRAME_LIMIT
 }

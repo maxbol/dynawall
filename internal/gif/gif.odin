@@ -777,37 +777,10 @@ DEFAULT_PALETTE := []u8 {
 	192,
 }
 
-
-// /* gif_writer.c */
-// struct gif_writer {
-//   struct {
-//     enum gif_source_type dst_type;
-//     union {
-//       struct darray *ptr;
-//       FILE *file;
-//     } dst;
-//   } meta;
-//   unsigned int width;
-//   unsigned int height;
-//   unsigned int n_colors;
-//   unsigned char code_size;
-//   unsigned char *palette;
-// };
-
-// enum gif_source_type {
-//   GIF_FILE,
-//   GIF_BUFFER
-// };
-
-// enum gif_tag {
-//   TAG_GRAPHIC_EXTENSION = 0x21,
-//   TAG_GRAPHIC_CONTROL_LABEL = 0xf9,
-//   TAG_COMMENT_LABEL = 0xfe,
-//   TAG_APPLICATION_LABEL = 0xff,
-//   TAG_PLAIN_TEXT_LABEL = 0x01,
-//   TAG_IMAGE_DESCRIPTOR = 0x2c,
-//   TAG_TRAILER = 0x3b
-// };
+GifSourceType :: enum {
+	GifFile,
+	GifBuffer,
+}
 
 GifTag :: enum (u8) {
 	TagGraphicExtension    = 0x21,
@@ -819,30 +792,27 @@ GifTag :: enum (u8) {
 	TagTrailer             = 0x3b,
 }
 
-GifSourceType :: enum {
-	GifFile,
-	GifBuffer,
-}
-
 GifWriterMetaDst :: union {
 	[dynamic]u8,
 	os.Handle,
 }
 
-// struct gif_opts {
-//   unsigned int delay;
-//   unsigned char flags;
-//   unsigned char trans_index;
-// };
+WriteImageError :: union #shared_nil {
+	runtime.Allocator_Error,
+	lzw.CompressError,
+}
+
+GifGraphicControlFlags :: bit_field u8 {
+	transparent_color: bool | 1,
+	user_input:        bool | 1,
+	disposal_method:   bool | 3,
+	reserved:          bool | 3,
+}
 
 GifOpts :: struct {
 	delay:       uint,
-	flags:       u8,
+	flags:       GifGraphicControlFlags,
 	trans_index: u8,
-}
-
-GifWriterMeta :: struct {
-	dst: GifWriterMetaDst,
 }
 
 GifWriter :: struct {
@@ -854,263 +824,25 @@ GifWriter :: struct {
 	palette:   []u8,
 }
 
-// int gifw_init(struct gif_writer *g,
-//               unsigned char code_size,
-//               unsigned char *palette,
-//               unsigned int width,
-//               unsigned int height) {
-//   if (!g) return -1;
-//   g->width = width;
-//   g->height = height;
-//   if (palette) {
-//     g->code_size = code_size;
-//     g->n_colors = 1u << g->code_size;
-//     g->palette = palette;
-//   } else {
-//     g->code_size = 8;
-//     g->n_colors = 256;
-//     g->palette = DEFAULT_PALETTE;
-//   }
-//   g->meta.dst_type = GIF_BUFFER;
-//   g->meta.dst.ptr = danew(g->width * g->height);
-//   if (!g->meta.dst.ptr) return -1;
-//   header(g);
-//   logical_screen(g);
-//   netscape_loop(g);
-//   return 0;
-// }
-//
-
-// static void header(struct gif_writer *g) {
-// #define GIF_HEADER_SIZE 6
-//
-//   unsigned char version[] = { 'G', 'I', 'F', '8', '9', 'a' };
-//
-//   write_bytes(g, GIF_HEADER_SIZE, version);
-//
-// #undef GIF_HEADER_SIZE
-// }
-//
-
-// static void write_bytes(struct gif_writer *g,
-//                         size_t len,
-//                         unsigned char *bytes) {
-//   if (g->meta.dst_type == GIF_FILE) {
-//     fwrite(bytes, len, 1, g->meta.dst.file);
-//   } else {
-//     dapushn(g->meta.dst.ptr, len, bytes);
-//   }
-// }
-//
-
-// static void logical_screen(struct gif_writer *g) {
-// #define LOGICAL_SCREEN_DESCRIPTOR_SIZE 7
-// #define GLOBAL_COLOR_TABLE_FLAG 0x80
-// #define GLOBAL_COLOR_TABLE_SIZE 0x07
-//
-//   unsigned char lsd[LOGICAL_SCREEN_DESCRIPTOR_SIZE];
-//
-//   WRITE2BYTES(lsd, g->width);
-//   WRITE2BYTES(lsd + 2, g->height);
-//   /* color table flag */
-//   lsd[4] = GLOBAL_COLOR_TABLE_FLAG;
-//   /* color table size */
-//   lsd[4] |= (unsigned char) (g->code_size - 1);
-//   /* background color index */
-//   lsd[5] = 0;
-//   /* aspect */
-//   lsd[6] = 0;
-//   write_bytes(g, LOGICAL_SCREEN_DESCRIPTOR_SIZE, lsd);
-//   /* write the palette: n_colors * 3 bytes (1 byte per channel RGB) */
-//   write_bytes(g, g->n_colors * 3u, g->palette);
-//
-// #undef LOGICAL_SCREEN_DESCRIPTOR_SIZE
-// #undef GLOBAL_COLOR_TABLE_FLAG
-// #undef GLOBAL_COLOR_TABLE_SIZE
-// }
-//
-
-// static void netscape_loop(struct gif_writer *g) {
-// #define APPLICATION_HEADER_SIZE 12
-//
-//   unsigned char header[APPLICATION_HEADER_SIZE];
-//
-//   write_byte(g, TAG_GRAPHIC_EXTENSION);
-//   write_byte(g, TAG_APPLICATION_LABEL);
-//   /* block size */
-//   header[0] = APPLICATION_HEADER_SIZE - 1;
-//   sprintf((char *) (header + 1), "NETSCAPE");
-//   header[9] = '2';
-//   header[10] = '.';
-//   header[11] = '0';
-//   write_bytes(g, APPLICATION_HEADER_SIZE, header);
-//   /* subblock size */
-//   write_byte(g, 3);
-//   /* subblock id */
-//   write_byte(g, 1);
-//   /* 2-byte loop count (0 = infinite) */
-//   write_byte(g, 0);
-//   write_byte(g, 0);
-//   /* terminator */
-//   write_byte(g, 0);
-//
-// #undef APPLICATION_HEADER_SIZE
-// }
-//
-
-// static void write_byte(struct gif_writer *g, unsigned char byte) {
-//   write_bytes(g, 1, &byte);
-// }
-//
-
-// void gifw_push(struct gif_writer *g,
-//                struct gif_opts *opts,
-//                unsigned int left,
-//                unsigned int top,
-//                unsigned int width,
-//                unsigned int height,
-//                unsigned char *img) {
-//   if (!g) return;
-//   if (opts) graphic_control(g, opts);
-//   image_descriptor(g, left, top, width, height);
-//   write_image(g, width, height, img);
-//   return;
-//
-// #undef CODE_SIZE_DEFAULT
-// }
-//
-
-// static void graphic_control(struct gif_writer *g, struct gif_opts *opts) {
-// #define GRAPHIC_CONTROL_HEADER_SIZE 5
-//
-//   unsigned char header[GRAPHIC_CONTROL_HEADER_SIZE];
-//
-//   write_byte(g, TAG_GRAPHIC_EXTENSION);
-//   write_byte(g, TAG_GRAPHIC_CONTROL_LABEL);
-//   /* block size */
-//   header[0] = GRAPHIC_CONTROL_HEADER_SIZE - 1;
-//   header[1] = opts->flags;
-//   WRITE2BYTES(header + 2, opts->delay);
-//   header[4] = opts->trans_index;
-//   write_bytes(g, GRAPHIC_CONTROL_HEADER_SIZE, header);
-//   /* terminator */
-//   write_byte(g, 0);
-//
-// #undef GRAPHIC_CONTROL_HEADER_SIZE
-// }
-//
-
-// static void image_descriptor(struct gif_writer *g,
-//                              unsigned int left,
-//                              unsigned int top,
-//                              unsigned int width,
-//                              unsigned int height) {
-// #define IMAGE_DESCRIPTOR_SIZE 9
-//
-//   unsigned char header[IMAGE_DESCRIPTOR_SIZE];
-//
-//   write_byte(g, TAG_IMAGE_DESCRIPTOR);
-//   WRITE2BYTES(header + 0, left);
-//   WRITE2BYTES(header + 2, top);
-//   WRITE2BYTES(header + 4, width);
-//   WRITE2BYTES(header + 6, height);
-//   /* flags */
-//   header[8] = 0;
-//   write_bytes(g, IMAGE_DESCRIPTOR_SIZE, header);
-//
-// #undef IMAGE_DESCRIPTOR_SIZE
-// }
-//
-
-// static int write_image(struct gif_writer *g,
-//                        unsigned int width,
-//                        unsigned int height,
-//                        unsigned char *img) {
-//   unsigned char *indexed_img, *compr, *tmp;
-//   unsigned int i, j;
-//   size_t len;
-//
-//   indexed_img = malloc(width * height);
-//   if (!indexed_img) return -1;
-//   for (i = 0; i < height; ++i) {
-//     for (j = 0; j < width; ++j) {
-//       unsigned char red, green, blue;
-//       size_t index;
-//
-//       index = (i * width) + j;
-//       red = img[(3 * index) + 0];
-//       green = img[(3 * index) + 1];
-//       blue = img[(3 * index) + 2];
-//       indexed_img[(i * width) + j] = calc_color(g, red, green, blue);
-//     }
-//   }
-//   lzw_compress_gif(g->code_size, width * height, indexed_img, &len, &compr);
-//   tmp = compr;
-//   write_byte(g, g->code_size);
-//   while (len > 255) {
-//     write_byte(g, 255);
-//     write_bytes(g, 255, tmp);
-//     tmp += 255;
-//     len -= 255;
-//   }
-//   write_byte(g, (unsigned char) len);
-//   write_bytes(g, len, tmp);
-//   write_byte(g, 0);
-//   free(compr);
-//   free(indexed_img);
-//   return 0;
-// }
-//
-
-WriteImageError :: union #shared_nil {
-	runtime.Allocator_Error,
-	lzw.CompressError,
+GifWriterMeta :: struct {
+	dst: GifWriterMetaDst,
 }
 
-// static unsigned char calc_color(struct gif_writer *gw,
-//                                 unsigned char r,
-//                                 unsigned char g,
-//                                 unsigned char b) {
-//   unsigned int i;
-//   struct {
-//     unsigned long min;
-//     unsigned char index;
-//   } result;
-//
-//   /* max out the value */
-//   result.min = ~0UL;
-//   result.index = 0;
-//   /* cycle through all colors in the palette */
-//   for (i = 0; i < gw->n_colors; ++i) {
-//     /* palette RGB */
-//     unsigned char pr, pg, pb;
-//     unsigned int index, delta;
-//
-//     index = 3 * i;
-//     pr = gw->palette[index + 0];
-//     pg = gw->palette[index + 1];
-//     pb = gw->palette[index + 2];
-//     delta = (unsigned int) ((pr - r) * (pr - r));
-//     delta += (unsigned int) ((pg - g) * (pg - g));
-//     delta += (unsigned int) ((pb - b) * (pb - b));
-//     if (delta < result.min) {
-//       result.min = delta;
-//       result.index = (unsigned char) i;
-//     }
-//   }
-//   return result.index;
-// }
-//
+ImageDescriptorFlags :: bit_field u8 {
+	local_color_table_size: u8   | 3,
+	reserved:               u8   | 2,
+	sort:                   bool | 1,
+	interlace:              bool | 1,
+	local_color_table:      bool | 1,
+}
+RgbPixel :: struct {
+	is_transparent: b8,
+	b:              u8,
+	g:              u8,
+	r:              u8,
+}
 
-// void gifw_end(struct gif_writer *g, size_t *out_len, unsigned char **out_img) {
-//   if (!g)
-//     return;
-//   write_byte(g, TAG_TRAILER);
-//   *out_len = dalen(g->meta.dst.ptr);
-//   *out_img = dapeel(g->meta.dst.ptr);
-// }
-
-calc_color :: proc(gw: ^GifWriter, r: u8, g: u8, b: u8) -> u8 {
+calc_color :: proc(r: u8, g: u8, b: u8, n_colors: uint, palette: []u8) -> u8 {
 	i: uint
 	result: struct {
 		min:   u32,
@@ -1120,14 +852,14 @@ calc_color :: proc(gw: ^GifWriter, r: u8, g: u8, b: u8) -> u8 {
 	result.min = ~u32(0)
 	result.index = 0
 
-	for i = 0; i < gw.n_colors; i += 1 {
+	for i = 0; i < n_colors; i += 1 {
 		pr, pg, pb: u8
 		index, delta: uint
 
 		index = 3 * i
-		pr = gw.palette[index + 0]
-		pg = gw.palette[index + 1]
-		pb = gw.palette[index + 2]
+		pr = palette[index + 0]
+		pg = palette[index + 1]
+		pb = palette[index + 2]
 		delta = uint((pr - r) * (pr - r))
 		delta += uint((pg - g) * (pg - g))
 		delta += uint((pb - b) * (pb - b))
@@ -1150,9 +882,15 @@ graphic_control :: proc(g: ^GifWriter, opts: ^GifOpts) {
 
 	// Block size
 	header[0] = GRAPHIC_CONTROL_HEADER_SIZE - 1
-	header[1] = opts.flags
+	header[1] = u8(opts.flags)
+
 	write_u16(header[2:], u16(opts.delay))
-	header[4] = opts.trans_index
+
+	if opts.flags.transparent_color {
+		header[4] = opts.trans_index
+	} else {
+		header[4] = 0
+	}
 
 	write_bytes(g, header[:])
 
@@ -1168,7 +906,14 @@ header :: proc(g: ^GifWriter) {
 	write_bytes(g, version)
 }
 
-image_descriptor :: proc(g: ^GifWriter, left: uint, top: uint, width: uint, height: uint) {
+image_descriptor :: proc(
+	g: ^GifWriter,
+	left: uint,
+	top: uint,
+	width: uint,
+	height: uint,
+	flags: ImageDescriptorFlags,
+) {
 	IMAGE_DESCRIPTOR_SIZE :: 9
 
 	header: [IMAGE_DESCRIPTOR_SIZE]u8
@@ -1179,7 +924,9 @@ image_descriptor :: proc(g: ^GifWriter, left: uint, top: uint, width: uint, heig
 	write_u16(header[4:6], u16(width))
 	write_u16(header[6:8], u16(height))
 
-	header[8] = 0
+	// Flags
+	header[8] = u8(flags)
+	fmt.printfln("Writing image descriptor flags: %b", u8(flags))
 
 	write_bytes(g, header[:])
 }
@@ -1194,9 +941,12 @@ logical_screen :: proc(g: ^GifWriter) {
 	write_u16(lsd[:2], u16(g.width))
 	write_u16(lsd[2:4], u16(g.height))
 
-	lsd[4] = GLOBAL_COLOR_TABLE_FLAG
-	fmt.println("g.code_size = ", g.code_size)
-	lsd[4] |= u8(g.code_size - 1)
+	// Set global palette if defined
+	if g.palette != nil {
+		lsd[4] = GLOBAL_COLOR_TABLE_FLAG
+		lsd[4] |= u8(g.code_size - 1)
+	}
+
 	// Bg color index
 	lsd[5] = 0
 	// Aspect
@@ -1206,7 +956,9 @@ logical_screen :: proc(g: ^GifWriter) {
 	write_bytes(g, lsd[:])
 
 	// Actually write the color table
-	write_bytes(g, g.palette)
+	if g.palette != nil {
+		write_bytes(g, g.palette)
+	}
 }
 
 netscape_loop :: proc(g: ^GifWriter) {
@@ -1253,11 +1005,20 @@ write_bytes :: proc(g: ^GifWriter, bytes: []u8) {
 	}
 }
 
-write_image :: proc(g: ^GifWriter, width: uint, height: uint, img: []u8) -> WriteImageError {
+write_image :: proc(
+	g: ^GifWriter,
+	width: uint,
+	height: uint,
+	img: []RgbPixel,
+	lct_code_size: u8,
+	lct_palette: []u8,
+	enable_transparency: bool,
+	transparency_index: u8,
+) -> WriteImageError {
 	tmp: []u8
 	i, j: uint
 
-	fmt.println("Writing ", len(img), "bytes to data block")
+	fmt.println("Writing ", len(img) * 3, "bytes to data block")
 
 	indexed_img, err := make([]u8, width * height)
 	// defer delete(indexed_img)
@@ -1267,21 +1028,32 @@ write_image :: proc(g: ^GifWriter, width: uint, height: uint, img: []u8) -> Writ
 		return err
 	}
 
+	palette: []u8
+	code_size: u8
+	if lct_palette == nil {
+		palette = g.palette
+		code_size = g.code_size
+	} else {
+		palette = lct_palette
+		code_size = lct_code_size
+	}
+	n_colors: uint = (1 << lct_code_size)
+
 	for i = 0; i < height; i += 1 {
 		for j = 0; j < width; j += 1 {
-			red, green, blue: u8
-			index: uint
+			index := (i * width) + j
+			col := img[index]
 
-			index = (i * width) + j
-			red = img[(3 * index) + 0]
-			green = img[(3 * index) + 1]
-			blue = img[(3 * index) + 2]
-			indexed_img[(i * width) + j] = calc_color(g, red, green, blue)
+			if enable_transparency && col.is_transparent {
+				indexed_img[index] = transparency_index
+			} else {
+				indexed_img[index] = calc_color(col.r, col.g, col.b, n_colors, palette)
+			}
 		}
 	}
+
 	fmt.println("Indexed image size:", len(indexed_img), "bytes")
-	fmt.println("Initial code size (bit width):", g.code_size)
-	compress_err, compr := lzw.compress_gif(g.code_size, indexed_img)
+	compress_err, compr := lzw.compress_gif(code_size, indexed_img)
 	if compress_err != nil {
 		fmt.println("Error when compressing GIF:", compress_err)
 		return compress_err
@@ -1289,11 +1061,10 @@ write_image :: proc(g: ^GifWriter, width: uint, height: uint, img: []u8) -> Writ
 	defer delete(compr)
 
 	fmt.println("Compressed size: ", len(compr))
-	fmt.println("Post-compression code size (bit width):", g.code_size)
 
 	tmp = compr[:]
 
-	write_byte(g, g.code_size)
+	write_byte(g, code_size)
 
 	for len(tmp) > 255 {
 		write_byte(g, 255)
@@ -1335,7 +1106,7 @@ writer_create :: proc(
 	} else {
 		g.code_size = 8
 		g.n_colors = 256
-		g.palette = DEFAULT_PALETTE
+		g.palette = nil
 	}
 	err: runtime.Allocator_Error
 	g.meta.dst, err = make([dynamic]u8, 0, g.width * g.height)
@@ -1374,7 +1145,9 @@ writer_push :: proc(
 	top: uint,
 	width: uint,
 	height: uint,
-	img: []byte,
+	img: []RgbPixel,
+	lct_code_size: u8,
+	lct_palette: []u8,
 ) {
 	if g == nil {
 		return
@@ -1384,9 +1157,36 @@ writer_push :: proc(
 		graphic_control(g, opts)
 	}
 
-	image_descriptor(g, left, top, width, height)
+	flags := ImageDescriptorFlags{}
+	if lct_palette != nil {
+		flags.local_color_table = true
+		flags.local_color_table_size = lct_code_size - 1
+	}
 
-	write_image(g, width, height, img)
+	image_descriptor(g, left, top, width, height, flags)
+
+	// Write local color table if available
+	if lct_palette != nil {
+		write_bytes(g, lct_palette)
+	}
+
+	fmt.println(
+		"Writing image with transparency=",
+		opts.flags.transparent_color,
+		"with index",
+		opts.trans_index,
+	)
+
+	write_image(
+		g,
+		width,
+		height,
+		img,
+		lct_code_size,
+		lct_palette,
+		opts.flags.transparent_color,
+		opts.trans_index,
+	)
 
 	return
 }
