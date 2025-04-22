@@ -123,7 +123,6 @@ TimeContext :: struct {
 	local_time:             f32,
 	delta:                  f64,
 	seconds_elapsed:        f64,
-	time_cyclic:            f64,
 	limit_start, limit_end: f64,
 }
 
@@ -153,9 +152,10 @@ ExportImageType :: enum {
 }
 
 ShaderType :: enum {
-	Helloworld = 0,
-	Voronoi2   = 1,
-	Monterrey2 = 2,
+	Helloworld    = 0,
+	Voronoi2      = 1,
+	Monterrey2    = 2,
+	Voronoi2NoBuf = 3,
 }
 
 
@@ -235,6 +235,9 @@ create_time_ctx :: proc(opts: ^Options) -> (bool, TimeContext) {
 	time_ctx.limit_start = opts.seconds_start
 	time_ctx.limit_end = opts.seconds_end
 	time_ctx.boomerang = opts.boomerang
+	time_ctx.delta = 0
+	time_ctx.seconds_elapsed = 0
+	time_ctx.local_time = 0
 
 	if time_ctx.limit_end == 0 && time_ctx.boomerang {
 		fmt.println("Error: Can't use boomerang mode if --seconds-end is not set or set to 0")
@@ -263,7 +266,13 @@ draw :: proc(
 	set_uniform_values(ul, time_ctx, image)
 
 	gl.BindVertexArray(gl_ctx.vao)
-	gl.DrawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, nil)
+
+	if is_buffer_required(gl_ctx.shader_type) {
+		gl.DrawElements(gl.TRIANGLES, 6, gl.UNSIGNED_INT, nil)
+	} else {
+		gl.DrawArrays(gl.TRIANGLE_STRIP, 0, 4)
+	}
+
 }
 
 export :: proc(opts: ^Options) -> bool {
@@ -399,7 +408,7 @@ export_gif :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocation
 	PER_FRAME_DELAY_SECONDS: f64 : PER_FRAME_DELAY_CENTISECONDS / 100
 
 	if ctx.time.limit_end == 0 {
-		fmt.println("Can't export GIF without a known end time, please specifiy -seconds-end")
+		fmt.println("Can't export GIF without a known end time, please specifiy --seconds-end")
 		return false
 	}
 
@@ -557,6 +566,36 @@ export_png :: proc(ctx: ^ExportContext, gl_ctx: ^GLContext, ul: ^UniformLocation
 	return true
 }
 
+get_frag_shader_embedded :: proc(shader_type: ShaderType) -> string {
+	bytes: []byte
+	switch (shader_type) {
+	case .Monterrey2:
+		bytes = #load("./shaders/monterrey2.frag")
+	case .Voronoi2NoBuf:
+		fallthrough
+	case .Voronoi2:
+		bytes = #load("./shaders/voronoi2.frag")
+	case .Helloworld:
+		bytes = #load("./shaders/helloworld.frag")
+	}
+	return transmute(string)bytes
+}
+
+get_frag_shader_path :: proc(shader_type: ShaderType) -> string {
+	path: string
+	switch (shader_type) {
+	case .Monterrey2:
+		path = "./shaders/monterrey2.frag"
+	case .Voronoi2NoBuf:
+		path = "./shaders/voronoi2.frag"
+	case .Voronoi2:
+		path = "./shaders/voronoi2.frag"
+	case .Helloworld:
+		path = "./shaders/helloworld.frag"
+	}
+	return path
+}
+
 get_pixels :: proc(prev: []u8, next: []u8, width: i32, height: i32) -> []gif.RgbPixel {
 	out := make([]gif.RgbPixel, width * height * 3)
 
@@ -598,31 +637,6 @@ get_pixels :: proc(prev: []u8, next: []u8, width: i32, height: i32) -> []gif.Rgb
 	}
 
 	return out
-}
-get_frag_shader_embedded :: proc(shader_type: ShaderType) -> string {
-	bytes: []byte
-	switch (shader_type) {
-	case .Monterrey2:
-		bytes = #load("./shaders/monterrey2.frag")
-	case .Voronoi2:
-		bytes = #load("./shaders/voronoi2.frag")
-	case .Helloworld:
-		bytes = #load("./shaders/helloworld.frag")
-	}
-	return transmute(string)bytes
-}
-
-get_frag_shader_path :: proc(shader_type: ShaderType) -> string {
-	path: string
-	switch (shader_type) {
-	case .Monterrey2:
-		path = "./shaders/monterrey2.frag"
-	case .Voronoi2:
-		path = "./shaders/voronoi2.frag"
-	case .Helloworld:
-		path = "./shaders/helloworld.frag"
-	}
-	return path
 }
 
 get_shader_prog :: proc(shader_type: ShaderType) -> (bool, u32) {
@@ -675,6 +689,8 @@ get_vert_shader_embedded :: proc(shader_type: ShaderType) -> string {
 		fallthrough
 	case .Helloworld:
 		bytes = #load("./vertex_shader.vert")
+	case .Voronoi2NoBuf:
+		bytes = #load("./vertex_nobuf.vert")
 	}
 	return transmute(string)bytes
 }
@@ -688,6 +704,8 @@ get_vert_shader_path :: proc(shader_type: ShaderType) -> string {
 		fallthrough
 	case .Helloworld:
 		path = "./vertex_shader.vert"
+	case .Voronoi2NoBuf:
+		path = "./vertex_nobuf.vert"
 	}
 	return path
 }
@@ -709,31 +727,32 @@ gl_setup :: proc() -> (bool, GLContext) {
 		} else {
 			gl_ctx.hot_reload_shader_ts = info.modification_time._nsec
 		}
-
 	}
 
 	gl_ctx.shader_type = config.shader
 	gl_ctx.program = program
 
-	vertices := []f32{1.0, 1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0}
-	indices := []u32{0, 1, 3, 1, 2, 3}
-
 	gl.GenVertexArrays(1, &gl_ctx.vao)
-	gl.GenBuffers(1, &gl_ctx.vbo)
-	gl.GenBuffers(1, &gl_ctx.ebo)
-
 	gl.BindVertexArray(gl_ctx.vao)
 
-	gl.BindBuffer(gl.ARRAY_BUFFER, gl_ctx.vbo)
-	gl.BufferData(gl.ARRAY_BUFFER, 12 * size_of(f32), &vertices[0], gl.STATIC_DRAW)
+	if (is_buffer_required(gl_ctx.shader_type)) {
+		vertices := []f32{1.0, 1.0, 0.0, 1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0}
+		indices := []u32{0, 1, 3, 1, 2, 3}
 
-	gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl_ctx.ebo)
-	gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, 6 * size_of(u32), &indices[0], gl.STATIC_DRAW)
+		gl.GenBuffers(1, &gl_ctx.vbo)
+		gl.GenBuffers(1, &gl_ctx.ebo)
 
-	gl.VertexAttribPointer(0, 3, gl.FLOAT, gl.FALSE, 3 * size_of(f32), 0)
-	gl.EnableVertexAttribArray(0)
+		gl.BindBuffer(gl.ARRAY_BUFFER, gl_ctx.vbo)
+		gl.BufferData(gl.ARRAY_BUFFER, 12 * size_of(f32), &vertices[0], gl.STATIC_DRAW)
 
-	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+		gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl_ctx.ebo)
+		gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, 6 * size_of(u32), &indices[0], gl.STATIC_DRAW)
+
+		gl.VertexAttribPointer(0, 3, gl.FLOAT, gl.FALSE, 3 * size_of(f32), 0)
+		gl.EnableVertexAttribArray(0)
+
+		gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	}
 
 	gl.ClearColor(1.0, 1.0, 1.0, 1.0)
 
@@ -800,6 +819,21 @@ io_write_context_from_handle :: proc(handle: os.Handle) -> (bool, IOWriteContext
 
 	return true, write_ctx
 }
+is_buffer_required :: proc(type: ShaderType) -> bool {
+	switch (type) {
+	case .Voronoi2NoBuf:
+		return false
+	case .Helloworld:
+		fallthrough
+	case .Voronoi2:
+		fallthrough
+	case:
+		fallthrough
+	case .Monterrey2:
+		return true
+	}
+}
+
 key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
 	if key == glfw.KEY_ESCAPE {
 		running = false
@@ -1079,6 +1113,8 @@ parse_shader :: proc(shader_str: string) -> ShaderType {
 	switch (shader_str) {
 	case "voronoi2":
 		return .Voronoi2
+	case "voronoi2nobuf":
+		return .Voronoi2NoBuf
 	case "monterrey2":
 		return .Monterrey2
 	case:
