@@ -1031,10 +1031,12 @@ median_cut_quantize :: proc(pixels: []gif.RgbPixel, max_colors: int) -> []u8 {
 
 open_rw_writer_create_if_notexists :: proc(path: string) -> (bool, os.Handle) {
 	file_exists := os.exists(path)
+	path_c := strings.clone_to_cstring(path)
 	handle, err := os.open(path, os.O_WRONLY | os.O_CREATE)
 
+
 	if !file_exists {
-		err := os.fchmod(handle, os.S_IRUSR | os.S_IWUSR | os.S_IRGRP | os.S_IROTH)
+		err := posix.chmod(path_c, {.IRUSR, .IWUSR, .IRGRP, .IROTH})
 		if err != nil {
 			fmt.println("Error setting file permissions for exported file:", err)
 			return false, 0x00
@@ -1205,7 +1207,7 @@ serve :: proc(opts: ^Options) -> bool {
 	monitors := glfw.GetMonitors()
 	contexts: [dynamic]ServeContext
 
-	for monitor, i in monitors {
+	for monitor, i in monitors[1:] {
 		ok, ctx := serve_setup_context(monitor, opts)
 		if !ok {
 			fmt.printfln("Error while initializing monitor context %d, panicing", i)
@@ -1255,9 +1257,9 @@ serve_setup_context :: proc(monitor: glfw.MonitorHandle, opts: ^Options) -> (boo
 
 	glfw.WindowHint(glfw.CONTEXT_VERSION_MAJOR, GL_MAJOR_VERSION)
 	glfw.WindowHint(glfw.CONTEXT_VERSION_MINOR, GL_MINOR_VERSION)
-	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 	glfw.WindowHint(glfw.DECORATED, glfw.FALSE)
 	glfw.WindowHint(glfw.FOCUSED, glfw.FALSE)
+	glfw.WindowHint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 	glfw.WindowHint(glfw.FOCUS_ON_SHOW, glfw.FALSE)
 
 	if (ODIN_OS == .Darwin) {

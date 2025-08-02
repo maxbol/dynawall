@@ -10,22 +10,31 @@
     ...
   }: (flake-utils.lib.eachDefaultSystem (system: let
     pkgs = nixpkgs.legacyPackages.${system};
-    odin_override = pkgs.odin.override {
-      MacOSX-SDK = "${pkgs.apple-sdk_14.sdkroot}";
-    };
+    odin-final =
+      if pkgs.stdenv.hostPlatform.isDarwin
+      then
+        pkgs.odin.override {
+          MacOSX-SDK = "${pkgs.apple-sdk_14.sdkroot}";
+        }
+      else pkgs.odin;
   in
     with pkgs; let
       pname = "dynawall";
       version = "git";
 
-      buildInputs = [
-        odin_override
-        apple-sdk_14
-        libGL
-        libGLU
-        glfw
-        glew
-      ];
+      buildInputs =
+        [
+          odin-final
+          libGL
+          libGLU
+          glfw
+          glew
+        ]
+        ++ (
+          if pkgs.stdenv.hostPlatform.isDarwin
+          then [apple-sdk_14]
+          else []
+        );
     in {
       packages = {
         default = stdenv.mkDerivation {
@@ -35,7 +44,7 @@
 
           buildPhase = ''
             mkdir -p build/bin
-            ${lib.getExe odin_override} build . -minimum-os-version=14.0 -out=build/bin/${pname}
+            ${lib.getExe odin-final} build . -minimum-os-version=14.0 -out=build/bin/${pname}
           '';
 
           installPhase = ''
@@ -55,7 +64,7 @@
             [
               clang
               ols
-              odin_override
+              odin-final
               clang-tools
               llvm_17
               lldb_17
